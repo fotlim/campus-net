@@ -100,6 +100,7 @@ $VbsFile    = Join-Path $WorkDir 'run-hidden.vbs'
 $TaskName   = 'CampusNet-AutoLogin'
 $RepairTaskName = 'CampusNet-Repair'
 $UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+$script:AppVersion = '1.0.1'
 $Curl = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
 $script:NicList = $null
 $script:NicListAt = [datetime]::MinValue
@@ -4846,6 +4847,7 @@ function Show-Menu {
         Write-Stdout ''
         Write-Stdout '=================================================='
         Write-Stdout '                校园网自动登录'
+        Write-Stdout ('                      v' + $script:AppVersion)
         Write-Stdout '=================================================='
         if ($store.accounts.Count -eq 0) {
             Write-Stdout '  当前账号: (未设置)'
