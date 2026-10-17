@@ -391,16 +391,87 @@ Windows 的 WiFi 列表是**缓存**的:刚开机、刚唤醒、刚从别的网�
 | id | 说明 |
 | --- | --- |
 | `drcom` | 中国电信 Dr.COM,RC4 + auth_tag(默认,本机实测通过) |
+| `esurfing` | 广东电信 天翼校园网(`enet.10000.gd.cn` 客户端协议,JSON + 大写 MD5 签名) |
 | `form` | 通用表单:POST 明文,成功与否靠连通性(改名/改 host/template 就能套大多数自建门户) |
 | `srun` | 深澜 Srun 骨架(各校差异大,密码算法常是 hmd5,可能需要改 `encrypt`) |
 
+### 自动识别门户(就靠"连上就弹认证页"那一下)
+
+连上校园网后浏览器会自动弹认证页,本质是**你的外网请求被 302 到了门户**。脚本直接复刻这个动作:
+
+```
+GET http://www.msftconnecttest.com/connecttest.txt   → 302  Location: <门户地址>
+```
+
+拿到 `Location` 之后看地址就能认出是哪家:
+
+| 门户地址里出现 | 判定 | 处理 |
+| --- | --- | --- |
+| `ac_portal` / `1.1.1.4` | 中国电信 Dr.COM | 切 `drcom`,顺便把新的 `page`(模板 ID)写进配置 |
+| `enet.10000.gd.cn` / `wlanuserip=` | 广东电信 天翼校园网 | 切 `esurfing` |
+| `srun` | 深澜 | 切 `srun` |
+| `eportal` / `锐捷` | 锐捷 ePortal | 只报出厂商,不改配置(得手工填接口) |
+
+三个触发点:
+
+```powershell
+.\Connect-CampusNet.ps1 -Mode portal -AutoPortal      # 手动识别一次并写回 portal.json
+.\Connect-CampusNet.ps1 -Mode portal -DetectPortal    # 只看不改(顺带打印现场参数)
+# 菜单 O) 里输入 auto
+```
+
+另外**登录失败会自动试一次**:密码没错却登不上,脚本会去抓门户地址,发现门户变了(换校区、门户改版、模板 ID 变了)就自动换配置再重试一次,并把改动写进日志。
+
+> 说明:这套自动识别解决的是"**门户地址 / 厂商 / 页面路径**"。真正发登录请求还得知道对方的参数格式和密码算法 —— 已知的那几家(Dr.COM、天翼、通用表单)内置好了;遇到没见过的厂商,`-DetectPortal` 会把地址和现场参数打出来,照着填 `portal.json` 即可。
+
+### 天翼校园网(广东电信)
+
+`esurfing` 预设走的是**天翼客户端协议**,不是网页表单。四个请求,全部 JSON,每个都带 `timestamp` 和大写 MD5 签名(密钥固定串 `Eshore!@#`):
+
+| 步骤 | 请求 | 签名用的串 |
+| --- | --- | --- |
+| 1 学校 ID | `POST /client/queryschool` | `clientip+nasip+mac+timestamp+secret` |
+| 2 会话 Cookie | `GET /advertisement.do?<schoolid>` | — |
+| 3 取 challenge | `POST /client/vchallenge` | `version+clientip+nasip+mac+timestamp+secret` |
+| 4 登录 | `POST /client/login` | `clientip+nasip+mac+timestamp+challenge+secret` |
+
+两个关键点:
+
+- **不需要识别验证码**。网页版(`qs/index_gz.jsp` + `image_code.jsp`)那套是给人敲的 4 位图形码;客户端协议的 `challenge` 是服务端下发的,原样回填进签名和请求体就行 —— 这也是它能全自动的原因。
+- **`clientip` / `nasip` 不用手填**。未认证时跳转地址形如 `http://enet.10000.gd.cn:10001/?wlanuserip=100.2.49.240&wlanacip=119.146.175.80`,脚本从里面抠。MAC 按 `clientip` 反查网卡;如果这个 IP 不是本机的(前面还有路由器 / 经过 NAT),退回用默认路由出口网卡的 MAC。
+
+先用这个看现场(输出里不含密码):
+
+```powershell
+.\Connect-CampusNet.ps1 -Mode portal -PortalId esurfing
+.\Connect-CampusNet.ps1 -Mode portal -DetectPortal
+```
+
+正常会看到 `clientip` / `nasip` / `mac` / `queryschool` / `vchallenge` 五行,`rescode` 是 `0` 就说明协议对上了,接着 `-Mode login` 即可。返回码对照:
+
+| rescode | 含义 |
+| --- | --- |
+| `0` | 成功 |
+| `13002000` | 已经在线(重复登录) |
+| `13012000` / `13004000` | 密码错 / 账号认证失败 |
+| `11064000` | 登录太频繁,等几分钟 |
+| `13018000` | 服务器禁止第三方认证(只能用官方客户端) |
+| `13016000` | 账号没订购校园网产品 |
+| `11063000` / `13005000` | challenge 对不上 / 超时 —— 脚本会自动重拿 challenge 重试 |
+| `13000000` | 签名或参数被拒(多半是 MAC / clientip / nasip 对不上) |
+
+参数都在 `portal.json` 里,可改: `version`(客户端版本号,默认 `214`)、`iswifi`(默认 `4060`)、`macFormat`(`colon-lower` / `colon-upper` / `plain-lower` / `plain-upper`)、`schoolid`(查到后填上可省一步)。
+
 **验证方式**:除了本机真实门户(Dr.COM 全流程登录成功),还起了一个**本地假门户**(监听 127.0.0.1,返回 JSON),分别用 `none` / `md5` / `base64` 三种加密跑通;`rc4_ms` 发给假门户时按预期被拒(它不认识 RC4),说明加密分支和失败判定都对。
+
+天翼这条链路用**假服务器**验证过:mock 服务端独立按协议重算 MD5 签名,四步全部 `sign=True`,`client/login` 回 `rescode 0`,脚本判定登录成功;自动识别也测了(把探测地址指向一个返回假 302 的本地服务,脚本正确把配置从 `drcom` 切成 `esurfing`)。**还没在真实的工贸/天翼网络里跑过** —— 需要在那个网络里跑一次 `-DetectPortal` 才能确认 `version` / `iswifi` / MAC 格式这几个参数对不对。
 
 **做不到的部分(先说清楚)**
 
-- 带**图形验证码 / 短信验证码 / 滑块**的门户:需要识别验证码,不在本脚本能力范围
+- 带**图形验证码 / 短信验证码 / 滑块**的门户:需要识别验证码,不在本脚本能力范围(天翼走的是客户端协议,没有图形码;但如果你们学校只开了网页认证入口,那套 4 位图形码脚本不处理)
 - **Portal 协议加密**(如锐捷的 `wlan_user_ip` + JS 混淆、深澜的 hmd5 带 token):`encrypt` 只能覆盖常见几种,复杂的还得按你学校改模板或加算法分支
-- **802.1X / 客户端认证**(锐捷、华为的 supplicant):那是完全不同的协议,不是 HTTP 表单
+- **802.1X / 客户端认证**(锐捷、华为的 supplicant,以及很多学校**教学区**用的 PEAP 企业级 WiFi):那是完全不同的协议,不是 HTTP 表单。像广东工贸教学区的 `GDGM-T` / `GDGM-S` 就是 802.1X,Windows 自己就能连(输工号/学号 + 密码),脚本不掺和;脚本负责的是宿舍区那种**连上要弹认证页**的(`young`、360 之类)
+- **服务器明令禁止第三方认证**(天翼 `rescode 13018000`):协议对也没用,只能改用官方客户端
 ## 命令行用法
 
 ```powershell
@@ -458,6 +529,8 @@ Windows 的 WiFi 列表是**缓存**的:刚开机、刚唤醒、刚从别的网�
 | **劫持检测** | ✅ 实测:调门户 `opr=logout` 注销后,诊断准确判为「未认证(被劫持: 被重定向到门户…)」,而不是笼统的"不通";随后登录恢复正常 |
 | 托盘气泡 / 双击登录 | ✅ 已换成通知中心 Toast;双击托盘仍=立即登录 |
 | **门户改版自检** | ✅ 指纹 7/7 通过、退出码 0;`-Deep` 假账号被正确拒绝;**反向测试**用坏模板 ID 时准确报 404 并判"检测到变化";守护每 24h 自动跑一次并写日志 |
+| **天翼协议(esurfing)** | ✅ 假服务器实测:mock 端独立重算 MD5,`queryschool` / `vchallenge` / `client/login` 三步 `sign=True`,`rescode 0` 判定登录成功;**未在真实天翼网络实测** |
+| **自动识别门户** | ✅ 假 302 实测:探测地址返回天翼式跳转 → 正确识别并自动把 `portal.json` 从 `drcom` 切成 `esurfing`(写回文件、日志留痕) |
 | **窗口背景图** | ✅ 实测:写入默认 profile 的 3 个键、文件无 BOM、JSON 仍合法;`-ClearBackground` 能干净移除;测试完已把你的配置**逐字节还原**(哈希一致) |
 | **真实账号登录** | ✅ 已实测:`登录成功: logon success` + 连通性复检通过(2026-10-17 15:54) |
 | **网速监控** | ✅ 自测:先基线(`—`)→ 实时读数(`622 B/s` → 拉一次网页后 `689 KB/s`),峰值 / 累计同步更新;托盘提示 + 菜单两项三处都正常刷新 |

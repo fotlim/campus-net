@@ -1,10 +1,11 @@
 ﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
-    校园网(中国电信 Dr.COM 认证门户)自动登录 —— 菜单 / 托盘 / 开机自启 / 后台守护 / 多账号
+    校园网自动登录 —— 菜单 / 托盘 / 开机自启 / 后台守护 / 多账号
+    支持中国电信 Dr.COM、广东电信天翼校园网,以及可配置的通用表单门户
 
 .DESCRIPTION
-    登录逻辑逆向自门户页面(logic_new.js),已交叉验证:
+    默认按 Dr.COM 门户走(逆向自门户页面 logic_new.js):
 
       POST http://1.1.1.4/ac_portal/login.php
       opr=pwdLogin & userName=<账号> & pwd=<RC4 hex> & auth_tag=<毫秒时间戳> & rememberPwd=0
@@ -12,9 +13,16 @@
 
     因为 auth_tag 依赖系统时间,脚本会用门户服务器返回的 Date 头自动校正本机时间。
 
+    换个学校就换协议:门户参数都在 portal.json 里,`-Mode portal` 查看/切换。
+    已经内置:
+      drcom     Dr.COM(RC4 + auth_tag)
+      esurfing  广东电信天翼校园网(enet.10000.gd.cn 客户端协议,JSON + 大写 MD5 签名)
+      form      通用表单(明文 / md5 / sha1 / base64)
+      srun      深澜 Srun(骨架)
+
 .PARAMETER Mode
     menu | setup | switch | delete | list | login | status | watch | tray | install | uninstall | synctime
-    wifi | doctor | check | background | log | repair | notify | nicreset | pet
+    wifi | doctor | check | background | log | repair | notify | nicreset | pet | weather | portal
 
 .NOTES
     桌面宠物的动画素材来自开源项目 dsh-pet(MIT License):
@@ -64,6 +72,10 @@ param(
     # 门户配置(通用认证)
     [string]$PortalId,
     [switch]$DetectPortal,
+    [switch]$AutoPortal,
+
+    # 换一组探测地址(默认那几个外网地址;调试/内网测试时用)
+    [string[]]$ProbeUrl,
 
     # 兼容旧参数
     [switch]$Status,
@@ -618,11 +630,11 @@ function Get-NetStatus {
                     $res.Online = $true; $res.Detail = '微软探测通过'
                     return $res
                 }
-                if ($code -match '^30[12378]$' -and $loc -match ('ac_portal|' + [regex]::Escape($PortalHost))) {
+                if ($code -match '^30[12378]$' -and $loc -match ('ac_portal|wlanuserip|10000\.gd\.cn|' + [regex]::Escape($PortalHost))) {
                     $res.Hijacked = $true; $res.Detail = ('被重定向到门户: ' + $loc)
                     return $res
                 }
-                if ($code -eq '200' -and $body -match 'ac_portal') {
+                if ($code -eq '200' -and $body -match 'ac_portal|wlanuserip') {
                     $res.Hijacked = $true; $res.Detail = '直接返回了门户页面(透明劫持)'
                     return $res
                 }
@@ -670,6 +682,7 @@ function Get-PortalPresets {
     $drcom = [pscustomobject]@{
         id           = 'drcom'
         name         = '中国电信 Dr.COM(RC4 + auth_tag)'
+        protocol     = 'template'
         host         = '1.1.1.4'
         page         = '/ac_portal/20250303113805/pc.html?template=20250303113805&tabs=pwd&dual_stack=0&vlanid=1033'
         loginUrl     = 'http://{host}/ac_portal/login.php'
@@ -684,6 +697,7 @@ function Get-PortalPresets {
     $form = [pscustomobject]@{
         id           = 'form'
         name         = '通用表单(明文 / md5 / base64)'
+        protocol     = 'template'
         host         = '192.168.1.1'
         page         = '/'
         loginUrl     = 'http://{host}/login'
@@ -698,6 +712,7 @@ function Get-PortalPresets {
     $srun = [pscustomobject]@{
         id           = 'srun'
         name         = '深澜 Srun(实验性)'
+        protocol     = 'template'
         host         = '10.0.0.55'
         page         = '/srun_portal_pc?ac_id=1&theme=pro'
         loginUrl     = 'http://{host}/srun_portal_pc'
@@ -709,7 +724,29 @@ function Get-PortalPresets {
         msgMatch     = '"error_msg"\s*:\s*"([^"]*)"'
         note         = '深澜各校版本差异大,真实密码算法常是 hmd5(带 token)。这里给的是骨架,密码规则可能还要改 encrypt 字段。'
     }
-    return @($drcom, $form, $srun)
+    $esurfing = [pscustomobject]@{
+        id           = 'esurfing'
+        name         = '广东电信 天翼校园网(enet.10000.gd.cn 客户端协议)'
+        protocol     = 'esurfing'
+        host         = 'enet.10000.gd.cn:10001'
+        page         = ''
+        loginUrl     = 'http://{host}/client/login'
+        method       = 'POST'
+        contentType  = 'application/json'
+        encrypt      = 'none'
+        template     = ''
+        successMatch = '"rescode"\s*:\s*"?0"?'
+        msgMatch     = '"resinfo"\s*:\s*"([^"]*)"'
+        secret       = 'Eshore!@#'
+        version      = '214'
+        iswifi       = '4060'
+        schoolid     = ''
+        clientip     = ''
+        nasip        = ''
+        macFormat    = 'colon-lower'
+        note         = '客户端协议:queryschool → advertisement.do → vchallenge → client/login,JSON + 大写 MD5 签名(密钥 Eshore!@#)。clientip/nasip 自动从门户跳转地址里取,一般不用手填。'
+    }
+    return @($drcom, $form, $srun, $esurfing)
 }
 
 function Get-PortalPreset {
@@ -721,8 +758,16 @@ function Get-PortalPreset {
 function Save-PortalProfile {
     param($Profile)
     try {
-        ($Profile | Select-Object id, name, host, page, loginUrl, method, contentType, encrypt, template, successMatch, msgMatch, note |
-            ConvertTo-Json) | Set-Content -Path $script:PortalFn -Encoding UTF8
+        # 只写这个协议用得上的字段,别把别的预设的 null 塞进文件
+        $keep = @('id', 'name', 'protocol', 'host', 'page', 'loginUrl', 'method', 'contentType', 'encrypt',
+            'template', 'successMatch', 'msgMatch', 'secret', 'version', 'iswifi', 'schoolid', 'clientip', 'nasip',
+            'macFormat', 'note')
+        $obj = [ordered]@{}
+        foreach ($k in $keep) {
+            $v = $Profile.PSObject.Properties[$k]
+            if ($v -and $null -ne $v.Value) { $obj[$k] = $v.Value }
+        }
+        ($obj | ConvertTo-Json) | Set-Content -Path $script:PortalFn -Encoding UTF8
         return $true
     } catch {
         Write-Log ('保存 portal.json 失败:' + $_.Exception.Message) 'ERROR'
@@ -739,12 +784,12 @@ function Get-PortalProfile {
     }
     try {
         $p = Get-Content $script:PortalFn -Raw -Encoding UTF8 | ConvertFrom-Json
-        foreach ($k in @('id', 'name', 'host', 'page', 'loginUrl', 'method', 'contentType', 'encrypt', 'template', 'successMatch', 'msgMatch', 'note')) {
+        foreach ($k in @('id', 'name', 'protocol', 'host', 'page', 'loginUrl', 'method', 'contentType', 'encrypt', 'template', 'successMatch', 'msgMatch', 'secret', 'version', 'iswifi', 'schoolid', 'clientip', 'nasip', 'macFormat', 'note')) {
             if (-not $p.PSObject.Properties[$k]) { $p | Add-Member -NotePropertyName $k -NotePropertyValue $def.$k -Force }
         }
         if (-not $p.host) { $p.host = $def.host }
         if (-not $p.loginUrl) { $p.loginUrl = $def.loginUrl }
-        if (-not $p.template) { $p.template = $def.template }
+        if (-not $p.template -and [string]$p.protocol -ne 'esurfing') { $p.template = $def.template }
         if (-not $p.encrypt) { $p.encrypt = 'none' }
         return $p
     } catch {
@@ -785,6 +830,9 @@ function Invoke-PortalLogin {
     param([string]$Account, [string]$PlainPassword)
 
     $pf = Get-PortalProfile
+    if ([string]$pf.protocol -eq 'esurfing') {
+        return (Invoke-ESurfingLogin -Account $Account -PlainPassword $PlainPassword)
+    }
     $h = $(if ($PortalHost) { $PortalHost } else { $pf.host })
 
     if ($pf.page) {
@@ -840,28 +888,502 @@ function Invoke-PortalLogin {
     return [pscustomobject]@{ Success = $ok; Msg = $msg; Raw = $text }
 }
 
+# ---------------- 天翼校园网(广东电信 enet.10000.gd.cn) ----------------
+# 天翼不是「一张表单 POST 完事」,而是客户端协议,四步走:
+#   1) client/queryschool   学校 ID(只用来取会话 Cookie,拿不到也能登)
+#   2) advertisement.do     顺手薅一个会话 Cookie
+#   3) client/vchallenge    取 challenge(服务端下发的短信码,不用 OCR —— 这正是它比网页版好使的地方)
+#   4) client/login         真正登录
+# 每个请求都是 JSON,都带 timestamp 和大写 MD5 签名,密钥是固定串 Eshore!@#。
+# clientip / nasip 不用手填:未认证时访问任意网站会被 302 到
+#   http://enet.10000.gd.cn:10001/?wlanuserip=<clientip>&wlanacip=<nasip>
+# 从跳转地址里抠出来即可。
+
+function ConvertTo-EsJsonString {
+    param([string]$Text)
+    $s = [string]$Text
+    $s = $s.Replace('\', '\\').Replace('"', '\"')
+    return '"' + $s + '"'
+}
+
+function New-EsSign {
+    param([string]$Buffer)
+    return ((Get-StringHash -Text $Buffer -Algo 'MD5')).ToUpperInvariant()
+}
+
+function Format-MacAddress {
+    param([string]$Mac, [string]$Style = 'colon-lower')
+    $hex = ([string]$Mac -replace '[^0-9A-Fa-f]', '').ToLowerInvariant()
+    if ($hex.Length -ne 12) { return [string]$Mac }
+    $pairs = @()
+    for ($i = 0; $i -lt 12; $i += 2) { $pairs += $hex.Substring($i, 2) }
+    $joined = ($pairs -join ':')
+    switch ($Style) {
+        'colon-upper' { return $joined.ToUpperInvariant() }
+        'plain-lower' { return $hex }
+        'plain-upper' { return $hex.ToUpperInvariant() }
+        default { return $joined }
+    }
+}
+
+function Get-LocalNetInfo {
+    # 按 IP 反查网卡,拿到 MAC(签名里要用)
+    param([string]$Ip)
+    $r = [pscustomobject]@{ Ip = [string]$Ip; Mac = ''; IfIndex = 0; Alias = '' }
+    if ([string]::IsNullOrWhiteSpace($Ip)) { return $r }
+    try {
+        $a = Get-NetIPAddress -IPAddress $Ip -ErrorAction Stop | Select-Object -First 1
+        if ($a) {
+            $r.IfIndex = [int]$a.InterfaceIndex
+            $r.Alias = [string]$a.InterfaceAlias
+            $na = Get-NetAdapter -InterfaceIndex $r.IfIndex -ErrorAction SilentlyContinue
+            if ($na -and $na.MacAddress) { $r.Mac = ([string]$na.MacAddress).ToLowerInvariant() }
+        }
+    } catch { }
+    if (-not $r.Mac) {
+        try {
+            $c = Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' -ErrorAction Stop |
+                Where-Object { $_.IPAddress -contains $Ip } | Select-Object -First 1
+            if ($c -and $c.MACAddress) { $r.Mac = ([string]$c.MACAddress).ToLowerInvariant() }
+        } catch { }
+    }
+    return $r
+}
+
+# ------- 自动识别门户(连上校园网后浏览器会自动弹认证页,本质就是「外网请求被 302」) -------
+$script:CaptiveProbes = @(
+    'http://www.msftconnecttest.com/connecttest.txt',
+    'http://connect.rom.miui.com/generate_204',
+    'http://www.qq.com/',
+    'http://189.cn/'
+)
+
+function Get-CaptiveRedirect {
+    # 复制一次「浏览器弹认证页」:探一个外网地址,把 302 的 Location 抓下来 —— 那门户地址
+    param([string[]]$ProbeUrl = @())
+    $probes = $(if ($ProbeUrl -and $ProbeUrl.Count -gt 0) { $ProbeUrl } else { $script:CaptiveProbes })
+    foreach ($t in $probes) {
+        try {
+            $probeHost = ''
+            try { $probeHost = ([uri]$t).Host } catch { }
+            $line = ((& $Curl -s -o NUL -A $UA -w '%{http_code}|%{redirect_url}' --max-time 6 $t 2>$null) -join '').Trim()
+            if (-not $line) { continue }
+            $parts = $line -split '\|', 2
+            $code = $parts[0]
+            $loc = $(if ($parts.Count -gt 1) { [string]$parts[1] } else { '' })
+            if (-not $loc -or $code -notmatch '^30[12378]$') { continue }
+
+            $locHost = ''
+            try { $locHost = ([uri]$loc).Host } catch { }
+
+            # 带认证参数 = 门户;换了主机且不是"正常跳转" = 门户
+            $isPortal = ($loc -match 'wlanuserip=|wlanacip=|ac_portal|srun|eportal|/portal/|:8080/')
+            if (-not $isPortal -and $locHost) {
+                $isPortal = ($locHost -ne $probeHost) -and
+                            ($locHost -notmatch '(^|\.)(qq\.com|bing\.com|baidu\.com|msftconnecttest\.com|msftncsi\.com|gstatic\.com|apple\.com|miui\.com)$')
+            }
+            if ($isPortal) { return $loc }
+        } catch { }
+    }
+    return ''
+}
+
+function Get-PortalFingerprint {
+    # 光凭门户地址就能认出是哪家,顺带把「主机 + 路径」拿来当配置
+    param([string]$Url)
+    $f = [pscustomobject]@{ Vendor = '未知'; Id = ''; Host = ''; Page = '/'; Url = [string]$Url; LoginUrl = '' }
+    if ([string]::IsNullOrWhiteSpace($Url)) { return $f }
+    try {
+        $u = [uri]$Url
+        $f.Host = [string]$u.Authority
+        $f.Page = [string]$u.PathAndQuery
+        if (-not $f.Page) { $f.Page = '/' }
+    } catch { return $f }
+
+    if ($Url -match '10000\.gd\.cn|10000\.cn|esurfing|:10001/|wlanuserip=(?:\d+\.){3}\d+') {
+        $f.Vendor = '广东电信 天翼校园网'
+        $f.Id = 'esurfing'
+        $f.Host = 'enet.10000.gd.cn:10001'
+        $f.Page = '/'
+        $f.LoginUrl = 'http://{host}/client/login'
+        return $f
+    }
+    if ($Url -match 'ac_portal|1\.1\.1\.4') {
+        $f.Vendor = '中国电信 Dr.COM'
+        $f.Id = 'drcom'
+        $f.LoginUrl = 'http://{host}/ac_portal/login.php'
+        return $f
+    }
+    if ($Url -match 'srun|深澜') {
+        $f.Vendor = '深澜 Srun'
+        $f.Id = 'srun'
+        $f.LoginUrl = 'http://{host}/srun_portal_pc'
+        return $f
+    }
+    if ($Url -match 'eportal|锐捷|ruijie') { $f.Vendor = '锐捷 ePortal'; return $f }
+    if ($Url -match 'sangfor|深信服') { $f.Vendor = '深信服'; return $f }
+    if ($Url -match 'h3c|huawei|portal') { $f.Vendor = 'H3C / 华为 / 通用 Portal'; return $f }
+    return $f
+}
+
+function Invoke-PortalAdapt {
+    # 看现在被劫持到哪,顺势把 portal.json 改成对得上的那套
+    param([string]$Url = '', [switch]$Quiet)
+
+    $pf = Get-PortalProfile
+    $capUrl = $(if ($Url) { $Url } else { Get-CaptiveRedirect })
+    if (-not $capUrl) {
+        if (-not $Quiet) { Write-Log '没抓到门户跳转(可能已经在线,或者这个网络不劫持 HTTP)' 'WARN' }
+        return [pscustomobject]@{ Changed = $false; Vendor = ''; Url = ''; Reason = '没抓到跳转' }
+    }
+
+    $fp = Get-PortalFingerprint $capUrl
+    if (-not $Quiet) { Write-Log ('抓到门户: ' + $capUrl) }
+    if (-not $Quiet) { Write-Log ('识别为: ' + $fp.Vendor + $(if ($fp.Id) { ' (' + $fp.Id + ')' } else { '(没有现成预设)' })) }
+
+    $curId = [string]$pf.id
+    $reasons = @()
+    $changed = $false
+
+    if ($fp.Id -and $fp.Id -ne $curId) {
+        $preset = Get-PortalPreset $fp.Id
+        if ($preset) {
+            $pf = $preset
+            $changed = $true
+            $reasons += ('协议 ' + $curId + ' → ' + $fp.Id)
+        }
+    }
+
+    if ($fp.Id -and $fp.Id -eq [string]$pf.id) {
+        if ($fp.Host -and $fp.Host -ne [string]$pf.host) {
+            $pf.host = $fp.Host; $changed = $true; $reasons += ('门户地址 ' + $fp.Host)
+        }
+        # 页面路径只对「页面式」门户有意义(天翼是固定 API,不用改)
+        if ([string]$pf.id -ne 'esurfing' -and $fp.Page -and $fp.Page -ne '/' -and $fp.Page -ne [string]$pf.page) {
+            $pf.page = $fp.Page; $changed = $true; $reasons += ('认证页 ' + $fp.Page)
+        }
+    }
+
+    if ($changed) {
+        if (Save-PortalProfile $pf) {
+            Write-Log ('门户配置已自动更新: ' + ($reasons -join '、')) 'OK'
+        } else {
+            $changed = $false
+            $reasons += '写入 portal.json 失败'
+        }
+    } else {
+        if (-not $Quiet) { Write-Log '门户配置和当前环境一致,没动' }
+    }
+
+    return [pscustomobject]@{ Changed = $changed; Vendor = $fp.Vendor; Url = $capUrl; Reason = ($reasons -join '、') }
+}
+
+function Get-EsParam {
+    param([string]$Url)
+    $o = [pscustomobject]@{ Url = [string]$Url; ClientIp = ''; NasIp = '' }
+    if ([string]::IsNullOrWhiteSpace($Url)) { return $o }
+    if ($Url -match '[?&]wlanuserip=([^&]+)') { $o.ClientIp = [uri]::UnescapeDataString($Matches[1]) }
+    if ($Url -match '[?&]wlanacip=([^&]+)') { $o.NasIp = [uri]::UnescapeDataString($Matches[1]) }
+    return $o
+}
+
+function Invoke-EsJsonPost {
+    # curl 输出先落盘再按 UTF-8 读,免得中文响应被控制台代码页搞成乱码
+    param([string]$Url, [string]$Json, [string]$Cookie = '')
+    $id = [guid]::NewGuid().ToString('N')
+    $bodyFn = Join-Path $env:TEMP ('campusnet-es-' + $id + '.json')
+    $outFn = Join-Path $env:TEMP ('campusnet-es-' + $id + '.out')
+    try {
+        [System.IO.File]::WriteAllText($bodyFn, $Json, (New-Object System.Text.UTF8Encoding($false)))
+        $argList = @('-s', '--max-time', '15', '-A', $UA,
+            '-H', 'Content-Type: application/json; charset=UTF-8',
+            '--data-binary', ('@' + $bodyFn), '-o', $outFn, '-w', '%{http_code}')
+        if ($Cookie) { $argList += @('-H', ('Cookie: ' + $Cookie)) }
+        $argList += $Url
+        $httpCode = ((& $Curl @argList 2>$null) -join '').Trim()
+        $text = ''
+        if (Test-Path -LiteralPath $outFn) {
+            $text = [System.IO.File]::ReadAllText($outFn, [System.Text.Encoding]::UTF8).Trim()
+        }
+        return [pscustomobject]@{ Code = $httpCode; Text = $text }
+    } finally {
+        Remove-Item -LiteralPath $bodyFn, $outFn -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-EsCookie {
+    param([string]$Base, [string]$SchoolId)
+    if (-not $SchoolId) { return '' }
+    try {
+        $hdr = & $Curl -s -D - -o NUL -A $UA --max-time 8 ($Base + '/advertisement.do?' + $SchoolId) 2>$null
+        $c = @()
+        foreach ($line in ($hdr -split "`r?`n")) {
+            if ($line -match '^Set-Cookie:\s*([^;]+)') { $c += $Matches[1].Trim() }
+        }
+        return ($c -join '; ')
+    } catch { return '' }
+}
+
+function Get-EgressNic {
+    # 默认路由出口网卡(802.1X / NAT / 抓不到 clientip 时全靠它)
+    try {
+        $route = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop |
+            Sort-Object { [int]$_.RouteMetric } | Select-Object -First 1
+        if ($route) {
+            $na = Get-NetAdapter -InterfaceIndex $route.InterfaceIndex -ErrorAction SilentlyContinue
+            $ip = Get-NetIPAddress -InterfaceIndex $route.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                Where-Object { $_.IPAddress -notmatch '^169\.254\.' } | Select-Object -First 1
+            return [pscustomobject]@{
+                IfIndex = [int]$route.InterfaceIndex
+                Mac     = $(if ($na -and $na.MacAddress) { ([string]$na.MacAddress).ToLowerInvariant() } else { '' })
+                Alias   = $(if ($na) { [string]$na.Name } else { '' })
+                Ip      = $(if ($ip) { [string]$ip.IPAddress } else { '' })
+            }
+        }
+    } catch { }
+    return [pscustomobject]@{ IfIndex = 0; Mac = ''; Alias = ''; Ip = '' }
+}
+
+function Resolve-EsContext {
+    param([string]$ClientIp = '', [string]$NasIp = '')
+    # 只有缺参数时才去撞 302(每次登录都撞一遍太慢)
+    $capUrl = ''
+    if (-not $ClientIp -or -not $NasIp) { $capUrl = Get-CaptiveRedirect }
+    $p = Get-EsParam $capUrl
+    if (-not $ClientIp) { $ClientIp = $p.ClientIp }
+    if (-not $NasIp) { $NasIp = $p.NasIp }
+
+    $egress = $null
+    if (-not $ClientIp) {
+        # 没被劫持(可能已在线):用默认路由出口网卡的 IPv4 碰碰运气
+        $egress = Get-EgressNic
+        if ($egress.Ip) { $ClientIp = $egress.Ip }
+    }
+
+    # MAC 优先按 clientip 找;clientip 不是本机地址(经过 NAT / 前面还有路由器)时退回出口网卡
+    $mac = ''
+    if ($ClientIp) { $mac = (Get-LocalNetInfo -Ip $ClientIp).Mac }
+    if (-not $mac) {
+        if (-not $egress) { $egress = Get-EgressNic }
+        $mac = $egress.Mac
+    }
+    return [pscustomobject]@{ ClientIp = $ClientIp; NasIp = $NasIp; Mac = $mac; Redirect = $capUrl }
+}
+
+function Get-EsMessage {
+    param([string]$Code, [string]$Info = '')
+    $map = @{
+        '0'        = '认证成功'
+        '13002000' = '已经在线(重复登录)'
+        '13012000' = '密码错误'
+        '13004000' = '用户认证失败(多半是账号/密码不对)'
+        '11064000' = '登录太频繁,过几分钟再试'
+        '13018000' = '服务器禁止网页/第三方认证,只能改用官方客户端'
+        '13016000' = '这个账号没有订购校园网产品'
+        '11063000' = 'challenge 对不上(重试一次通常就好)'
+        '13005000' = '认证超时(等几秒重试)'
+        '13000000' = '参数被拒(检查 clientip/nasip/MAC 是否对得上本机)'
+    }
+    if ($Code -and $map.ContainsKey($Code)) { return ($map[$Code] + '(rescode ' + $Code + ')') }
+    if ($Info) { return ($Info + $(if ($Code) { '(rescode ' + $Code + ')' } else { '' })) }
+    return ('未知结果' + $(if ($Code) { '(rescode ' + $Code + ')' } else { '' }))
+}
+
+function Invoke-ESurfingLogin {
+    param([string]$Account, [string]$PlainPassword)
+
+    $pf = Get-PortalProfile
+    $api = [string]$pf.host
+    if ([string]::IsNullOrWhiteSpace($api)) { $api = 'enet.10000.gd.cn:10001' }
+    if ($api -notmatch ':') { $api = $api + ':10001' }
+    $secret = [string]$pf.secret; if (-not $secret) { $secret = 'Eshore!@#' }
+    $version = [string]$pf.version; if (-not $version) { $version = '214' }
+    $iswifi = [string]$pf.iswifi; if (-not $iswifi) { $iswifi = '4060' }
+    $macStyle = [string]$pf.macFormat; if (-not $macStyle) { $macStyle = 'colon-lower' }
+    $base = 'http://' + $api
+
+    $ctx = Resolve-EsContext -ClientIp ([string]$pf.clientip) -NasIp ([string]$pf.nasip)
+    $clientIp = [string]$ctx.ClientIp
+    $nasIp = [string]$ctx.NasIp
+    $mac = Format-MacAddress -Mac $ctx.Mac -Style $macStyle
+
+    Write-Log ('天翼认证参数:clientip=' + $(if ($clientIp) { $clientIp } else { '?' }) + ' nasip=' + $(if ($nasIp) { $nasIp } else { '?' }) + ' mac=' + $(if ($mac) { $mac } else { '?' }))
+    if ($ctx.Redirect) { Write-Log ('门户跳转:' + $ctx.Redirect) }
+
+    if (-not $clientIp) { throw '取不到 clientip(当前可能已在线,或者不在校园网)。先用浏览器点一次认证页,或运行 -Mode portal -DetectPortal 看现场' }
+    if (-not $mac) { throw '取不到本机网卡 MAC(签名要用)。确认 clientip 就是本机 IP' }
+    if (-not $nasIp) { Write-Log '拿不到 nasip(接入服务器 IP),继续尝试;签名可能对不上' 'WARN' }
+
+    # 1) 学校 ID
+    $schoolId = [string]$pf.schoolid
+    if (-not $schoolId) {
+        $ts = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds().ToString()
+        $sign = New-EsSign -Buffer ($clientIp + $nasIp + $mac + $ts + $secret)
+        $json = '{"clientip":' + (ConvertTo-EsJsonString $clientIp) + ',"nasip":' + (ConvertTo-EsJsonString $nasIp) +
+                ',"mac":' + (ConvertTo-EsJsonString $mac) + ',"timestamp":' + $ts + ',"authenticator":' + (ConvertTo-EsJsonString $sign) + '}'
+        try {
+            $r = Invoke-EsJsonPost -Url ($base + '/client/queryschool') -Json $json
+            if ($r.Text -match '"schoolid"\s*:\s*"?(\d+)"?') { $schoolId = $Matches[1] }
+            Write-Log ('queryschool:' + $(if ($schoolId) { '学校 ID ' + $schoolId } else { '没取到(不致命)' }))
+        } catch {
+            Write-Log ('queryschool 失败(不致命):' + $_.Exception.Message) 'WARN'
+        }
+    }
+
+    # 2) 会话 Cookie
+    $cookie = ''
+    if ($schoolId) {
+        try { $cookie = Get-EsCookie -Base $base -SchoolId $schoolId } catch { }
+        if ($cookie) { Write-Log ('拿到会话 Cookie:' + $cookie) }
+    }
+
+    $lastText = ''
+    $lastMsg = '没有发起请求'
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        # 3) vchallenge
+        $ts = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds().ToString()
+        $sign = New-EsSign -Buffer ($version + $clientIp + $nasIp + $mac + $ts + $secret)
+        $json = '{"version":' + (ConvertTo-EsJsonString $version) + ',"username":' + (ConvertTo-EsJsonString $Account) +
+                ',"clientip":' + (ConvertTo-EsJsonString $clientIp) + ',"nasip":' + (ConvertTo-EsJsonString $nasIp) +
+                ',"mac":' + (ConvertTo-EsJsonString $mac) + ',"timestamp":' + (ConvertTo-EsJsonString $ts) +
+                ',"authenticator":' + (ConvertTo-EsJsonString $sign) + '}'
+
+        $ch = Invoke-EsJsonPost -Url ($base + '/client/vchallenge') -Json $json -Cookie $cookie
+        $challenge = ''
+        if ($ch.Text -match '"challenge"\s*:\s*"([^"]*)"') { $challenge = $Matches[1] }
+        if (-not $challenge) {
+            $rc = ''
+            if ($ch.Text -match '"rescode"\s*:\s*"?(-?\d+)"?') { $rc = $Matches[1] }
+            $lastText = $ch.Text
+            Write-Log ('vchallenge 没给 challenge(HTTP ' + $ch.Code + '):' + $ch.Text) 'WARN'
+            return [pscustomobject]@{ Success = $false; Msg = ('取不到 challenge ' + (Get-EsMessage -Code $rc)); Raw = $ch.Text }
+        }
+        Write-Log ('challenge:' + $challenge)
+
+        # 4) client/login
+        $ts = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds().ToString()
+        $sign = New-EsSign -Buffer ($clientIp + $nasIp + $mac + $ts + $challenge + $secret)
+        $json = '{"username":' + (ConvertTo-EsJsonString $Account) + ',"password":' + (ConvertTo-EsJsonString $PlainPassword) +
+                ',"clientip":' + (ConvertTo-EsJsonString $clientIp) + ',"nasip":' + (ConvertTo-EsJsonString $nasIp) +
+                ',"mac":' + (ConvertTo-EsJsonString $mac) + ',"iswifi":' + (ConvertTo-EsJsonString $iswifi) +
+                ',"timestamp":' + (ConvertTo-EsJsonString $ts) + ',"authenticator":' + (ConvertTo-EsJsonString $sign) +
+                ',"verificationcode":' + (ConvertTo-EsJsonString $challenge) + '}'
+
+        $lr = Invoke-EsJsonPost -Url ($base + '/client/login') -Json $json -Cookie $cookie
+        $lastText = $lr.Text
+        $rc = ''
+        if ($lr.Text -match '"rescode"\s*:\s*"?(-?\d+)"?') { $rc = $Matches[1] }
+        $info = ''
+        if ($lr.Text -match '"resinfo"\s*:\s*"([^"]*)"') { $info = $Matches[1] }
+        $lastMsg = Get-EsMessage -Code $rc -Info $info
+        Write-Log ('client/login 返回(HTTP ' + $lr.Code + '):' + $lr.Text)
+
+        if ($rc -eq '0') {
+            if (Test-Online) { Write-Log '认证成功,连通性复检也通过' 'OK' }
+            else { Write-Log '认证成功,但立刻复检还没通(有些环境要几秒才放行)' 'WARN' }
+            return [pscustomobject]@{ Success = $true; Msg = $lastMsg; Raw = $lr.Text }
+        }
+
+        if ((@('11063000', '13005000') -contains $rc) -and $attempt -lt 3) {
+            Write-Log ('第 ' + $attempt + ' 次没成功(' + $lastMsg + '),重拿 challenge 再试') 'WARN'
+            Start-Sleep -Milliseconds 900
+            continue
+        }
+        return [pscustomobject]@{ Success = $false; Msg = $lastMsg; Raw = $lr.Text }
+    }
+
+    return [pscustomobject]@{ Success = $false; Msg = $lastMsg; Raw = $lastText }
+}
+
+function Invoke-EsDetect {
+    # 现场勘查:把天翼环境的关键参数和服务器原始返回都打出来,好对症改 portal.json
+    $pf = Get-PortalProfile
+    $api = [string]$pf.host; if ([string]::IsNullOrWhiteSpace($api)) { $api = 'enet.10000.gd.cn:10001' }
+    if ($api -notmatch ':') { $api = $api + ':10001' }
+    $base = 'http://' + $api
+    $secret = [string]$pf.secret; if (-not $secret) { $secret = 'Eshore!@#' }
+    $version = [string]$pf.version; if (-not $version) { $version = '214' }
+    $macStyle = [string]$pf.macFormat; if (-not $macStyle) { $macStyle = 'colon-lower' }
+
+    Write-Stdout ''
+    Write-Stdout '=== 天翼校园网 现场勘查 ==='
+    $ctx = Resolve-EsContext
+    Write-Stdout ('  重定向地址: ' + $(if ($ctx.Redirect) { $ctx.Redirect } else { '(没有 302 —— 可能已经在线,或者不在校园网)' }))
+    Write-Stdout ('  clientip:   ' + $(if ($ctx.ClientIp) { $ctx.ClientIp } else { '?' }))
+    Write-Stdout ('  nasip:      ' + $(if ($ctx.NasIp) { $ctx.NasIp } else { '?' }))
+    $mac = Format-MacAddress -Mac $ctx.Mac -Style $macStyle
+    Write-Stdout ('  mac:        ' + $(if ($mac) { $mac } else { '?' }) + '   (格式 ' + $macStyle + ')')
+    if (-not $ctx.ClientIp) { Write-Stdout '  提示: 拿不到参数就先把浏览器打开认证页再跑一次'; return }
+
+    $nic = Get-LocalNetInfo -Ip $ctx.ClientIp
+    Write-Stdout ('  网卡:       ' + $nic.Alias + '  ' + $nic.Mac)
+
+    $ts = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds().ToString()
+    $sign = New-EsSign -Buffer ($ctx.ClientIp + $ctx.NasIp + $mac + $ts + $secret)
+    $json = '{"clientip":' + (ConvertTo-EsJsonString $ctx.ClientIp) + ',"nasip":' + (ConvertTo-EsJsonString $ctx.NasIp) +
+            ',"mac":' + (ConvertTo-EsJsonString $mac) + ',"timestamp":' + $ts + ',"authenticator":' + (ConvertTo-EsJsonString $sign) + '}'
+    $sch = Invoke-EsJsonPost -Url ($base + '/client/queryschool') -Json $json
+    Write-Stdout ('  queryschool: HTTP ' + $sch.Code + '  ' + $sch.Text)
+
+    $ts = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds().ToString()
+    $sign = New-EsSign -Buffer ($version + $ctx.ClientIp + $ctx.NasIp + $mac + $ts + $secret)
+    $json = '{"version":' + (ConvertTo-EsJsonString $version) + ',"username":"","clientip":' + (ConvertTo-EsJsonString $ctx.ClientIp) +
+            ',"nasip":' + (ConvertTo-EsJsonString $ctx.NasIp) + ',"mac":' + (ConvertTo-EsJsonString $mac) +
+            ',"timestamp":' + (ConvertTo-EsJsonString $ts) + ',"authenticator":' + (ConvertTo-EsJsonString $sign) + '}'
+    $ch = Invoke-EsJsonPost -Url ($base + '/client/vchallenge') -Json $json
+    Write-Stdout ('  vchallenge:  HTTP ' + $ch.Code + '  ' + $ch.Text)
+    Write-Stdout ''
+    Write-Stdout '  这两步能返回 rescode 0 / challenge,说明协议对得上,直接登录即可:'
+    Write-Stdout '    .\Connect-CampusNet.ps1 -Mode portal -PortalId esurfing'
+    Write-Stdout '    .\Connect-CampusNet.ps1 -Mode login'
+    Write-Stdout '  如果 rescode 不是 0,把上面这几行发给作者(里面不含密码)'
+    Write-Stdout ''
+}
+
 function Show-PortalProfile {
     $pf = Get-PortalProfile
     $preset = Get-PortalPreset $pf.id
     Write-Stdout ''
     Write-Stdout '=== 当前门户配置 ==='
     Write-Stdout ('  名称:   ' + $pf.name + $(if (-not $preset) { '  (自定义)' } else { '' }))
+    Write-Stdout ('  协议:   ' + $(if ([string]$pf.protocol -eq 'esurfing') { 'esurfing(天翼客户端协议,多步 JSON)' } else { 'template(单次表单提交)' }))
     Write-Stdout ('  门户:   ' + $pf.host + $(if ($pf.page) { $pf.page } else { '' }))
     Write-Stdout ('  登录:   ' + $pf.method + ' ' + $pf.loginUrl)
-    Write-Stdout ('  加密:   ' + $pf.encrypt + '   (rc4_ms / md5 / sha1 / base64 / none)')
-    Write-Stdout ('  参数:   ' + $pf.template)
-    Write-Stdout ('  判定:   ' + $(if ($pf.successMatch) { '正则 ' + $pf.successMatch } else { '靠连通性复检' }))
+    if ([string]$pf.protocol -eq 'esurfing') {
+        Write-Stdout ('  版本:   version=' + $pf.version + '   iswifi=' + $pf.iswifi + '   MAC 格式=' + $pf.macFormat)
+        Write-Stdout ('  学校:   ' + $(if ($pf.schoolid) { 'ID ' + $pf.schoolid + '(固定)' } else { '自动查询' }))
+        Write-Stdout ('  签名:   MD5(大写),密钥 ' + $pf.secret + '   —— 串接顺序照抄客户端协议')
+        if ($pf.clientip -or $pf.nasip) { Write-Stdout ('  手填:   clientip=' + $pf.clientip + ' nasip=' + $pf.nasip) }
+        else { Write-Stdout '  参数:   clientip/nasip 自动从门户跳转地址里取' }
+    } else {
+        Write-Stdout ('  加密:   ' + $pf.encrypt + '   (rc4_ms / md5 / sha1 / base64 / none)')
+        Write-Stdout ('  参数:   ' + $pf.template)
+        Write-Stdout ('  判定:   ' + $(if ($pf.successMatch) { '正则 ' + $pf.successMatch } else { '靠连通性复检' }))
+    }
     if ($pf.note) { Write-Stdout ('  说明:   ' + $pf.note) }
     Write-Stdout ('  文件:   ' + $script:PortalFn)
     Write-Stdout ''
     Write-Stdout '  内置预设:'
-    foreach ($p in (Get-PortalPresets)) { Write-Stdout ('    ' + $p.id.PadRight(8) + $p.name) }
+    foreach ($p in (Get-PortalPresets)) { Write-Stdout ('    ' + $p.id.PadRight(10) + $p.name) }
     Write-Stdout ''
 }
 
 function Invoke-PortalDetect {
     # 抓门户页,按特征猜是哪家(猜不准就算了,不强行改配置)
     $pf = Get-PortalProfile
+
+    # 先看「被劫持到哪了」—— 天翼的跳转地址里直接带着 clientip/nasip
+    $capUrl = Get-CaptiveRedirect
+    if ($capUrl) {
+        Write-Stdout ('未认证,被重定向到: ' + $capUrl)
+        if ($capUrl -match '10000\.gd\.cn|10000\.cn|189\.cn|esurfing') {
+            Write-Stdout '识别结果: 广东电信 天翼校园网(enet.10000.gd.cn)'
+            Write-Stdout ''
+            Invoke-EsDetect
+            return
+        }
+    }
+
     $h = $(if ($PortalHost) { $PortalHost } else { $pf.host })
     $page = $(if ($pf.page) { $pf.page } else { '/' })
     $url = ('http://{0}{1}' -f $h, $page)
@@ -1112,23 +1634,38 @@ function Get-StateAge {
 
 # ---------------- 登录一次 ----------------
 function Invoke-LoginOnce {
-    param($Cred)
+    param($Cred, [switch]$NoAdapt)
 
     try {
         $res = Invoke-PortalLogin -Account $Cred.User -PlainPassword $Cred.Password
     } catch {
         Write-Log ('登录请求失败:' + $_.Exception.Message) 'ERROR'
-        return $false
+        $res = $null
     }
 
-    if ($res.Success) {
+    if ($res -and $res.Success) {
         Write-Log ('登录成功: ' + $res.Msg) 'OK'
         if (Test-Online) { Write-Log '连通性复检通过,可以上网了' 'OK' }
         else { Write-Log '返回成功但复检未通过(有些环境要几秒才放行)' 'WARN' }
         return $true
     }
 
-    Write-Log ('登录失败: ' + $res.Msg) 'ERROR'
+    if ($res) { Write-Log ('登录失败: ' + $res.Msg) 'ERROR' }
+
+    # 失败后先别急着报错:看一眼门户是不是变了(换校区/门户改版都会这样),变了就换配置再试一次。
+    # 只在"确实被劫持"时才去抓门户 —— 网络整个不通时去探没意义,只会让守护多等几十秒
+    if (-not $NoAdapt) {
+        $st = Get-NetStatus
+        if ($st.Hijacked) {
+            $a = Invoke-PortalAdapt
+            if ($a.Changed) {
+                Write-Log ('门户没匹配上,已自动切到「' + $a.Vendor + '」(' + $a.Reason + '),重试一次') 'OK'
+                return (Invoke-LoginOnce -Cred $Cred -NoAdapt)
+            }
+        } else {
+            Write-Log ('网络状态:' + $st.Detail + ',不去抓门户了')
+        }
+    }
     return $false
 }
 
@@ -4087,6 +4624,14 @@ function Invoke-Doctor {
 function Invoke-PortalCheck {
     param([switch]$Deep)
 
+    $pf0 = Get-PortalProfile
+    if ([string]$pf0.protocol -eq 'esurfing') {
+        # 天翼没有 Dr.COM 那套页面 + RC4 指纹,自检换成「接口是否还认这套协议」
+        Write-Log '门户自检:当前是天翼协议,改为探测 enet.10000.gd.cn 接口' 
+        $d = Invoke-EsDetect
+        return $true
+    }
+
     $items = New-Object System.Collections.ArrayList
     $lines = New-Object System.Collections.Generic.List[string]
     $pageUrl = 'http://{0}{1}' -f $PortalHost, $PortalPage
@@ -4346,6 +4891,8 @@ function Show-Menu {
         Write-Stdout '  P) 桌面宠物: 开/关切换'
         Write-Stdout '  W) 设置天气城市(留空=按 IP 定位)'
         Write-Stdout '  O) 门户类型 / 通用认证配置'
+        $curProto = [string](Get-PortalProfile).name
+        Write-Stdout ('       (当前: ' + $curProto + ')')
         Write-Stdout '  L) 查看日志'
         Write-Stdout '  0) 退出'
         Write-Stdout '=================================================='
@@ -4401,10 +4948,15 @@ function Show-Menu {
             }
             'O' {
                 Show-PortalProfile
-                $pid2 = Read-Host '输入预设 id 切换(回车取消;输入 detect 探测门户类型)'
+                $pid2 = Read-Host '输入预设 id 切换 / detect 探测 / auto 自动适配(回车取消)'
                 if (-not [string]::IsNullOrWhiteSpace($pid2)) {
                     $pid2 = $pid2.Trim()
                     if ($pid2 -eq 'detect') { Invoke-PortalDetect }
+                    elseif ($pid2 -eq 'auto') {
+                        $ra = Invoke-PortalAdapt
+                        if ($ra.Changed) { Write-Stdout ('已自动适配: ' + $ra.Vendor + '(' + $ra.Reason + ')') }
+                        else { Write-Stdout ('没有变化: ' + $ra.Reason) }
+                    }
                     else { [void](Set-PortalProfile -Id $pid2) }
                 }
             }
@@ -4441,6 +4993,7 @@ if (-not $Curl) {
 $profileNow = Get-PortalProfile
 if (-not $PSBoundParameters.ContainsKey('PortalHost') -and $profileNow.host) { $PortalHost = [string]$profileNow.host }
 if (-not $PSBoundParameters.ContainsKey('PortalPage') -and $profileNow.page) { $PortalPage = [string]$profileNow.page }
+if ($ProbeUrl -and $ProbeUrl.Count -gt 0) { $script:CaptiveProbes = $ProbeUrl }
 
 # ===== 最高优先级:程序一启动就先连 WiFi,再做别的事 =====
 if (@('menu', 'tray', 'watch', 'login', 'status', 'wifi') -contains $Mode) {
@@ -4514,6 +5067,14 @@ switch ($Mode) {
             }
         }
         if ($DetectPortal) { Invoke-PortalDetect; exit 0 }
+        if ($AutoPortal) {
+            # 看现在被劫持到哪,顺手把 portal.json 改对
+            $r = Invoke-PortalAdapt
+            if ($r.Changed) { Write-Stdout ('已自动适配: ' + $r.Vendor + '(' + $r.Reason + ')') }
+            else { Write-Stdout ('没有变化: ' + $r.Reason + $(if ($r.Url) { '  门户: ' + $r.Url } else { '' })) }
+            Show-PortalProfile
+            exit 0
+        }
         Show-PortalProfile
         exit 0
     }
