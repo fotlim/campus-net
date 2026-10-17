@@ -1,6 +1,6 @@
 # 校园网自动登录(托盘 + 开机自启 + 多账号 + WiFi + 校时 + 网速 + 一键诊断 + 通知中心 + 唤醒重认证 + 自动修复 + 桌宠)
 
-![version](https://img.shields.io/badge/version-1.0.1-blue)
+![version](https://img.shields.io/badge/version-1.1.0-blue)
 
 针对你学校这套 **中国电信 Dr.COM 校园网认证门户**(`http://1.1.1.4`);同一套脚本也内置了**广东电信天翼校园网**(`enet.10000.gd.cn`)和通用表单门户,换个学校不用改代码,详见 [通用版:换所学校也能用](#通用版换所学校也能用)。
 
@@ -390,12 +390,28 @@ Windows 的 WiFi 列表是**缓存**的:刚开机、刚唤醒、刚从别的网�
 
 **内置预设**
 
-| id | 说明 |
+| id | 门户 | 状态 |
+| --- | --- | --- |
+| `drcom` | 中国电信 Dr.COM(RC4 + auth_tag) | ✅ 真实门户实测 |
+| `esurfing` | 广东电信 天翼校园网(`enet.10000.gd.cn` 客户端协议) | ✅ 假服务器验证 |
+| `form` | 通用表单(明文 / md5 / sha1 / base64) | ✅ 假服务器验证 |
+| `jsonform` | 通用 JSON 表单(可带 token 两步) | ✅ 假服务器验证 |
+| `srun2` | 深澜 Srun v2(token 两步 + hmd5) | 🔧 骨架(token 那步已验证) |
+| `srun` | 深澜 Srun(老式单次表单) | 🔧 骨架 |
+| `ruijie` | 锐捷 ePortal | 🔧 骨架 |
+
+> ✅ = 三条链路真的跑通过;🔧 = 请求形状对、字段留好,但**密码算法/参数名各校不同**,得按抓包改两三个字段。
+
+**引擎能力**(换学校基本就这四件事)
+
+| 能力 | 怎么配 |
 | --- | --- |
-| `drcom` | 中国电信 Dr.COM,RC4 + auth_tag(默认,本机实测通过) |
-| `esurfing` | 广东电信 天翼校园网(`enet.10000.gd.cn` 客户端协议,JSON + 大写 MD5 签名) |
-| `form` | 通用表单:POST 明文,成功与否靠连通性(改名/改 host/template 就能套大多数自建门户) |
-| `srun` | 深澜 Srun 骨架(各校差异大,密码算法常是 hmd5,可能需要改 `encrypt`) |
+| 一次表单 POST / GET | `loginUrl` + `method` + `template` + `encrypt` |
+| 先取 token 再登录 | `tokenUrl` + `tokenMethod` + `tokenRegex`,登录模板里用 `{token}` |
+| JSON 体 | `contentType` 里带 `json` 即可,模板直接写 `{"username":"{user}"}`,值自动做 JSON 转义 |
+| 自定义头 / Referer | `headers`(多条用 `;;` 隔开)、`referer` |
+
+占位符:`{user}` `{pwd}`(加密后)`{plain}` `{tag}`(毫秒时间戳)`{host}` `{token}` `{clientip}`。
 
 ### 自动识别门户(就靠"连上就弹认证页"那一下)
 
@@ -409,10 +425,13 @@ GET http://www.msftconnecttest.com/connecttest.txt   → 302  Location: <门户�
 
 | 门户地址里出现 | 判定 | 处理 |
 | --- | --- | --- |
-| `ac_portal` / `1.1.1.4` | 中国电信 Dr.COM | 切 `drcom`,顺便把新的 `page`(模板 ID)写进配置 |
-| `enet.10000.gd.cn` / `wlanuserip=` | 广东电信 天翼校园网 | 切 `esurfing` |
-| `srun` | 深澜 | 切 `srun` |
-| `eportal` / `锐捷` | 锐捷 ePortal | 只报出厂商,不改配置(得手工填接口) |
+| `ac_portal` / `1.1.1.4` / `drcom` | 中国电信 Dr.COM | 切 `drcom`,顺便把新的 `page`(模板 ID)写进配置 |
+| `enet.10000.gd.cn` / `:10001` | 广东电信 天翼校园网 | 切 `esurfing` |
+| `srun` / `get_challenge` | 深澜 Srun | 只提示(骨架),要手工适配 |
+| `eportal` / `锐捷` / `wlan_user_ip` | 锐捷 ePortal | 只提示(骨架) |
+| `sangfor` / `h3c` / `huawei` | 深信服 / H3C / 华为 | 只报厂商 |
+
+自动切换只对**实测过**的 `drcom` / `esurfing` / `form` 生效;骨架预设不替你瞎改,只提示。
 
 三个触发点:
 
@@ -429,6 +448,30 @@ GET http://www.msftconnecttest.com/connecttest.txt   → 302  Location: <门户�
 **WiFi 名字不影响识别。** 脚本不靠 SSID 判断厂商 —— 同一所学校换名字(`young`、`wo`、`CIT-Chinanet`、`GDGM-S`……)、或者一个宿舍区两个 SSID 都很常见。SSID 只是一串要连的名字,填在菜单 `2) 设置目标 WiFi` 里(或 `-WifiSsid 'wo'`);真正的判断依据永远是**连上之后被 302 到哪个门户**。
 
 > 注意区分:名字像"沃/wo"的 SSID 有两种可能 —— 只是借了个名字的**天翼**网络(门户还是 `enet.10000.gd.cn`),或者真是**联通**自己的认证平台。跑一次 `-DetectPortal` 看跳转地址就知道了,后者目前没有现成预设,把地址发出来就能照着加一套。
+
+### 移动 / 联通 / 电信:运营商不是认证系统
+
+这一点最容易误会,先说清楚:
+
+> **电信、移动、联通只负责出口线路;宿舍楼里那套"连上就弹认证页"的系统,是学校另外采购的。**
+
+所以不存在"移动版认证""联通版认证"——同一所学校,学生接电信还是移动宽带,弹出来的**很可能是同一个门户**;反过来,两所都用电信的学校,门户可能一个是 Dr.COM、一个是深澜。
+
+现实中常见的组合:
+
+| 学校买的认证系统 | 门户特征 | 本脚本 |
+| --- | --- | --- |
+| **Dr.COM**(城市热点) | `1.1.1.4`、`ac_portal/login.php`、RC4 | ✅ 实测 |
+| **广东电信 天翼校园网** | `enet.10000.gd.cn:10001`、`wlanuserip=` | ✅ 假服务器验证 |
+| **深澜 Srun** | `srun_portal`、`get_challenge`、`/cgi-bin/srun_portal` | 🔧 骨架 |
+| **锐捷 ePortal(RG)** | `eportal/portal/login`、`wlan_user_ip` | 🔧 骨架 |
+| **深信服 Sangfor** | `sangfor`、`ac_logout` | ❌ 只认得出 |
+| **H3C / 华为** | `portal.cgi`、`hwportal` | ❌ 只认得出 |
+| **移动 / 联通自有平台** | `CMCC-EDU`、`wo`、`10086/10010` 域名 | ❌ 只认得出 |
+
+至于**运营商线索**(`-DetectPortal` 会打出来):`CMCC` / `10086` / `和校园` → 移动;`unicom` / `10010` / `wo` → 联通;`esurfing` / `189.cn` / `ChinaNet` → 电信。它只说明"这条线路是谁的",不决定用哪个预设。
+
+**账号形态也跟着学校走**:用 Dr.COM/深澜的学校常常直接填**手机号 + 服务密码**;天翼那套填**学号/手机号 + 校园网密码**。填错了报的是"密码错误",别误判成协议不对。
 
 ### 天翼校园网(广东电信)
 
@@ -471,6 +514,15 @@ GET http://www.msftconnecttest.com/connecttest.txt   → 302  Location: <门户�
 **验证方式**:除了本机真实门户(Dr.COM 全流程登录成功),还起了一个**本地假门户**(监听 127.0.0.1,返回 JSON),分别用 `none` / `md5` / `base64` 三种加密跑通;`rc4_ms` 发给假门户时按预期被拒(它不认识 RC4),说明加密分支和失败判定都对。
 
 天翼这条链路用**假服务器**验证过:mock 服务端独立按协议重算 MD5 签名,四步全部 `sign=True`,`client/login` 回 `rescode 0`,脚本判定登录成功;自动识别也测了(把探测地址指向一个返回假 302 的本地服务,脚本正确把配置从 `drcom` 切成 `esurfing`)。**还没在真实的工贸/天翼网络里跑过** —— 需要在那个网络里跑一次 `-DetectPortal` 才能确认 `version` / `iswifi` / MAC 格式这几个参数对不对。
+
+新引擎的两条路径也都用假门户验过:
+
+| 用例 | 服务端怎么验的 | 结果 |
+| --- | --- | --- |
+| token 两步 + md5 表单 | 先 `GET /tokenpage` 拿 token,登录必须带 `token=ABC123` 且 `password` 等于 `md5(test123)` | ✅ 三处全对,判定成功 |
+| JSON 体 | `Content-Type: application/json`,body 必须是合法 JSON 且 `password` 为 32 位 md5 | ✅ 解析通过,判定成功 |
+
+**`srun2` / `ruijie` 是骨架,不是"能用"**:token 那一步的形状(先 GET 拿 token、再拼进登录参数)是照真实门户的结构搭的,但各校的密码算法(`hmd5(md5(pwd)+token)`、`chksum` 拼法)和参数名不一样,必须按你学校的抓包改两三个字段。谁把这两家真跑通了,欢迎直接提 PR 或把抓包发出来。
 
 **做不到的部分(先说清楚)**
 
@@ -642,6 +694,15 @@ rememberPwd=0
 真要在登录前联网,需要改成 SYSTEM 运行 + `-MachineScope` 机器级加密 —— 需要就说一声。
 
 ## 更新日志
+
+### v1.1.0(2026-10-17)
+
+- **新增** 引擎支持**两步取 token**:`tokenUrl` / `tokenMethod` / `tokenRegex`,登录模板里用 `{token}` —— 深澜、锐捷和很多自建门户都是这个形状
+- **新增** **JSON 体**门户:`contentType` 带 `json` 就行,模板直接写 `{"username":"{user}"}`,值自动做 JSON 转义;请求体改走临时文件,顺手解决 PS 5.1 传参时引号被搞坏的问题
+- **新增** 预设 `jsonform`(通用 JSON 表单)、`srun2`(深澜 v2 token 骨架)、`ruijie`(锐捷骨架)
+- **改进** 门户指纹:先认域名再认关键字,修掉「任何带 `wlanuserip` 的地址都被判成天翼」的误判;新增**移动 / 联通 / 电信**运营商线索
+- **改进** 自动切换只对实测过的 `drcom` / `esurfing` / `form` 生效;骨架预设只提示、不改你的配置
+- **文档** 新增「移动 / 联通 / 电信 ≠ 认证系统」对照表;每个预设都标清是**实测**还是**骨架**
 
 ### v1.0.1(2026-10-17)
 
