@@ -100,7 +100,7 @@ $VbsFile    = Join-Path $WorkDir 'run-hidden.vbs'
 $TaskName   = 'CampusNet-AutoLogin'
 $RepairTaskName = 'CampusNet-Repair'
 $UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-$script:AppVersion = '1.1.0'
+$script:AppVersion = '1.1.1'
 $Curl = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
 $script:NicList = $null
 $script:NicListAt = [datetime]::MinValue
@@ -1136,6 +1136,40 @@ function Get-CaptiveRedirect {
     return ''
 }
 
+function Get-HttpsPortalHint {
+    # 浏览器「自动弹认证页」很多是被 HTTPS 劫持:请求被换成了门户页面。
+    # 这里用 -k 忽略证书错误取回页面,只要页面已经不是原来那个站点,就把标题和页面里的域名捞出来。
+    param([string]$Probe = 'https://www.baidu.com/')
+    $id = [guid]::NewGuid().ToString('N')
+    $outFn = Join-Path $env:TEMP ('campusnet-https-' + $id + '.html')
+    try {
+        $code = ((& $Curl -sk -L -A $UA --max-time 8 -o $outFn -w '%{http_code}' $Probe 2>$null) -join '').Trim()
+        if (-not $code -or $code -eq '000') { return $null }
+        if (-not (Test-Path -LiteralPath $outFn)) { return $null }
+        $html = [System.IO.File]::ReadAllText($outFn, [System.Text.Encoding]::UTF8)
+        if (-not $html) { return $null }
+        # 真页面里一定有 baidu.com;没有就是被换掉了
+        if ($html -match 'baidu\.com') { return $null }
+
+        $title = ''
+        if ($html -match '<title>([^<]{1,80})</title>') { $title = $Matches[1].Trim() }
+        $hosts = @()
+        foreach ($m in [regex]::Matches($html, 'https?://([a-zA-Z0-9\.\-]+(?::\d+)?)')) {
+            $hv = $m.Groups[1].Value.ToLowerInvariant()
+            if ($hv -match 'w3\.org|jquery|cdnjs|unpkg|jsdelivr|bdstatic|bcebos|gstatic') { continue }
+            if ($hosts -notcontains $hv) { $hosts += $hv }
+        }
+        return [pscustomobject]@{
+            Title = $(if ($title) { $title } else { '(没有标题)' })
+            Hosts = @($hosts | Select-Object -First 6)
+            Code  = $code
+            Size  = $html.Length
+        }
+    } catch { return $null } finally {
+        Remove-Item -LiteralPath $outFn -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Get-CarrierHint {
     # 运营商线索(只看域名和 SSID)。注意:运营商只决定出口线路,认证系统是学校另外买的
     param([string]$Url = '', [string]$Ssid = '')
@@ -1318,6 +1352,18 @@ function Get-EgressNic {
         }
     } catch { }
     return [pscustomobject]@{ IfIndex = 0; Mac = ''; Alias = ''; Ip = '' }
+}
+
+function Get-DefaultGatewayIp {
+    # 默认网关:门户域名打不开时,很多学校的认证页就架在网关上(10.x.0.1 这种)
+    try {
+        $r = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop |
+            Sort-Object { [int]$_.RouteMetric } | Select-Object -First 1
+        if ($r -and $r.NextHop -match '^\d+\.\d+\.\d+\.\d+$' -and $r.NextHop -ne '0.0.0.0') {
+            return [string]$r.NextHop
+        }
+    } catch { }
+    return ''
 }
 
 function Resolve-EsContext {
@@ -1560,7 +1606,28 @@ function Invoke-PortalDetect {
     if ($capUrl) {
         Write-Stdout ('未认证,被重定向到: ' + $capUrl)
     } else {
-        Write-Stdout '没抓到 302(可能已经在线,或者这个网络不劫持 HTTP)'
+        if (Test-Online) { Write-Stdout '当前已经在线,门户不会被劫持(要测识别:断开 WiFi 再连一次)' }
+        else { Write-Stdout '没抓到 302 —— 这个网络可能不在 HTTP 层拦(只拦 HTTPS),或者门户直接挂在网关上' }
+
+        # 门户域名不通时,先看网关:很多学校(尤其运营商宿舍网)的认证页就架在网关上
+        $gw0 = Get-DefaultGatewayIp
+        if ($gw0) {
+            foreach ($gu in @(('http://' + $gw0 + '/'), ('http://' + $gw0 + ':8080/'))) {
+                $gc = ''
+                try { $gc = ((& $Curl -s -o NUL -A $UA -w '%{http_code}' --max-time 5 $gu 2>$null) -join '').Trim() } catch { }
+                Write-Stdout ('  试网关: ' + $gu + ' → HTTP ' + $gc)
+                if ($gc -match '^[23]') {
+                    $gHtml = ''
+                    try { $gHtml = (& $Curl -s -L -A $UA --max-time 8 $gu 2>$null) -join "`n" } catch { }
+                    $gt = ''
+                    if ($gHtml -match '<title>([^<]{1,80})</title>') { $gt = $Matches[1] }
+                    Write-Stdout ('    网关上有页面: ' + $(if ($gt) { $gt } else { '(没有 title)' }) + '  ' + $gHtml.Length + ' 字节')
+                    if ($gHtml -match 'portal|login|认证|eportal|srun|wlanuserip|username') {
+                        Write-Stdout '    页面里有认证特征 → 这就是门户,把上面这个网关地址填进 host'
+                    }
+                }
+            }
+        }
     }
 
     $fp = Get-PortalFingerprint $capUrl
@@ -1579,6 +1646,20 @@ function Invoke-PortalDetect {
     $h = $(if ($PortalHost) { $PortalHost } else { $pf.host })
     $page = $(if ($pf.page) { $pf.page } else { '/' })
     $url = ('http://{0}{1}' -f $h, $page)
+
+    # HTTP 层没抓到跳转时,再看 HTTPS 层:浏览器"自动弹认证页"多半就是把 HTTPS 请求劫持了
+    if (-not $capUrl) {
+        $httpsHint = Get-HttpsPortalHint
+        if ($httpsHint) {
+            Write-Stdout ''
+            Write-Stdout ('HTTPS 层抓到劫持页: ' + $httpsHint.Title)
+            if ($httpsHint.Hosts.Count -gt 0) {
+                Write-Stdout ('  页面上出现的域名: ' + ($httpsHint.Hosts -join ' , '))
+                Write-Stdout '  → 门户地址多半在其中;用 -Mode portal -AutoPortal 试,或把域名填进 host'
+            }
+        }
+    }
+
     Write-Stdout ('探测: ' + $url)
     $html = ''
     try {
@@ -4674,6 +4755,24 @@ function Invoke-Doctor {
         else { Add-DoctorItem $items '门户可达' 'BAD' ('HTTP ' + $code) }
     } catch { Add-DoctorItem $items '门户可达' 'BAD' ('请求失败: ' + $_.Exception.Message) }
 
+    # 3.1 代理环境(开着代理软件时 curl 会全部返回 000,是最容易误判成"校园网不通"的坑)
+    if ($script:ProxyEnvHit -and $script:ProxyEnvHit.Count -gt 0) {
+        Add-DoctorItem $items '代理环境变量' 'WARN' (($script:ProxyEnvHit -join ' , ') + ' —— 已在本进程内忽略(认证必须直连)')
+    } else {
+        Add-DoctorItem $items '代理环境变量' 'OK' '没有 http_proxy 之类干扰'
+    }
+
+    # 3.2 网关页面(很多校园网门户就架在网关上,门户域名不通时靠这个找)
+    $gwIp = Get-DefaultGatewayIp
+    if ($gwIp) {
+        $gwCode = ''
+        try { $gwCode = ((& $Curl -s -o NUL -A $UA -w '%{http_code}' --max-time 5 ('http://{0}/' -f $gwIp) 2>$null) -join '').Trim() } catch { }
+        if ($gwCode -match '^[23]') { Add-DoctorItem $items '网关页面' 'OK' ($gwIp + ' 有响应 HTTP ' + $gwCode + '(门户可能就在这)') }
+        else { Add-DoctorItem $items '网关页面' 'WARN' ($gwIp + ' HTTP ' + $gwCode) }
+    } else {
+        Add-DoctorItem $items '网关页面' 'WARN' '读不到默认网关'
+    }
+
     # 4 DNS
     try {
         $dns = [System.Net.Dns]::GetHostAddresses('www.baidu.com') | Select-Object -First 1
@@ -4707,6 +4806,19 @@ function Invoke-Doctor {
     if ($ns.Online) { Add-DoctorItem $items '认证状态' 'OK' ('已通过认证 — ' + $ns.Detail) }
     elseif ($ns.Hijacked) { Add-DoctorItem $items '认证状态' 'BAD' ('未认证(被劫持: ' + $ns.Detail + ')') }
     else { Add-DoctorItem $items '认证状态' 'BAD' ('不通 — ' + $ns.Detail) }
+
+    # 7.1 门户识别:在线时门户不会被劫持,别白探
+    if ($ns.Online) {
+        Add-DoctorItem $items '门户识别' 'OK' '已在线,门户没被劫持(要测识别先断网重连)'
+    } else {
+        $cap = Get-CaptiveRedirect -ProbeUrl @('http://www.msftconnecttest.com/connecttest.txt', 'http://connect.rom.miui.com/generate_204')
+        if ($cap) {
+            $fp = Get-PortalFingerprint $cap
+            Add-DoctorItem $items '门户识别' 'OK' ($fp.Vendor + $(if ($fp.Id) { '(' + $fp.Id + ')' } else { '(无预设)' }) + ' ← ' + $cap)
+        } else {
+            Add-DoctorItem $items '门户识别' 'WARN' '探不到 302:门户可能只在 HTTPS 拦,或要手动开一次认证页'
+        }
+    }
 
     # 8 计划任务
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
@@ -5186,6 +5298,21 @@ function Show-Menu {
 if (-not $Curl) {
     Write-Log '找不到 curl.exe(Windows 10 1803+ 自带),请确认系统版本' 'ERROR'
     exit 2
+}
+
+# ===== 代理:校园网认证必须直连 =====
+# 开着代理软件时,curl 会跟着 http_proxy 走,对校园网地址一律 000 ——
+# 表现就是「门户可达 HTTP 000 / 探测返回 HTTP 000」这种查无实据的失败。
+$script:ProxyEnvHit = @()
+foreach ($pn in @('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY')) {
+    $pv = [Environment]::GetEnvironmentVariable($pn)
+    if (-not [string]::IsNullOrWhiteSpace($pv)) {
+        $script:ProxyEnvHit += ($pn + '=' + $pv)
+        [Environment]::SetEnvironmentVariable($pn, $null)
+    }
+}
+if ($script:ProxyEnvHit.Count -gt 0) {
+    Write-Log ('检测到代理环境变量,已在本进程内忽略(校园网认证必须直连):' + ($script:ProxyEnvHit -join ' , ')) 'WARN'
 }
 
 # ===== 门户配置:命令行没显式指定 -PortalHost/-PortalPage 时,以 portal.json 为准 =====
