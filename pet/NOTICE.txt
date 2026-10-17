@@ -1,0 +1,57 @@
+校园网自动登录 · 桌面宠物素材说明
+==================================
+
+素材来源(必须保留)
+------------------
+项目:DSH 桌面宠物 dsh-pet
+作者:PC2005-cloud
+地址:https://github.com/PC2005-cloud/dsh-pet
+
+本目录里的素材都来自该项目(assets/webm 与 assets/memes):
+
+动画(PNG 帧,24fps)
+    idle/     待机呼吸休闲.webm         (空闲循环,已选最平滑的循环点)
+    sleep/    原地小憩沉眠.webm         (离线/状态过期时)
+    walk/     原地漂浮踏步.webm         (自己溜达时)
+    wave/     点击回应-元气挥手.webm     (点一下的回应)
+    look/     东张西望.webm             (右键动作)
+    cat/      撸猫.webm                 (右键动作)
+    code/     写代码.webm               (右键动作)
+    hotpot/   涮火锅.webm               (右键动作)
+    rubik/    原地专心玩魔方.webm       (右键动作)
+    stretch/  超大伸懒腰.webm           (右键动作)
+    snack/    偷吃零食被抓住.webm       (右键动作)
+    angry/    点击回应-傲娇生气.webm    (右键动作)
+    tail/     用鲸鱼尾巴拍打地面.webm   (右键动作)
+
+表情包(memes/,27 张)
+    来自 assets/memes/ 下的 PNG,统一缩放到不超过 300px 宽。
+
+转换方式(见 tools/build-pet.py):
+  解码 webm → 黑底泛洪抠图转 alpha → 把不透明像素颜色向外扩一圈(去掉黑边)
+  → 裁剪到内容 → 缩放到 200px 高 → 按源帧率 24fps 逐帧导出 PNG。
+这一步在开发机上一次性完成,运行时不需要 ffmpeg,也不加载该项目的任何代码。
+
+许可证
+------
+MIT License
+
+Copyright (c) 2026 PC2005-cloud
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
