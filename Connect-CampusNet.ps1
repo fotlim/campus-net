@@ -32,7 +32,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('menu', 'setup', 'switch', 'delete', 'list', 'login', 'status', 'watch', 'tray', 'install', 'uninstall', 'synctime', 'wifi', 'doctor', 'check', 'background', 'log', 'repair', 'notify', 'nicreset', 'pet', 'weather', 'portal')]
+    [ValidateSet('menu', 'setup', 'switch', 'delete', 'list', 'login', 'status', 'watch', 'tray', 'install', 'uninstall', 'synctime', 'wifi', 'doctor', 'check', 'background', 'log', 'repair', 'notify', 'nicreset', 'pet', 'weather', 'portal', 'collect')]
     [string]$Mode = 'menu',
 
     [string]$User,
@@ -4711,6 +4711,193 @@ function Show-Log {
     } else { Write-Stdout '还没有日志' }
 }
 
+# ================= 远程适配:一键采集 =================
+function Invoke-Collect {
+    # 给「人不在现场」用的:把判断门户需要的东西全收起来,
+    # 文本自动进剪贴板(直接粘到聊天窗口),门户页和它的 JS 打进 zip 一起发。
+    param([switch]$NoZip)
+
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $dir = Join-Path $WorkDir ('collect-' + $stamp)
+    $lines = New-Object System.Collections.Generic.List[string]
+    $add = { param($t) $lines.Add([string]$t) }
+
+    & $add '===== 校园网远程适配 · 采集报告 ====='
+    & $add ('时间: ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+    & $add ('机器: ' + $env:COMPUTERNAME + ' / 用户 ' + $env:USERNAME)
+    & $add ('系统: ' + [Environment]::OSVersion.VersionString + '   PowerShell ' + $PSVersionTable.PSVersion.ToString())
+    & $add ('脚本: ' + $SelfScript + '   v' + $script:AppVersion)
+
+    # ---- 无线 ----
+    & $add ''
+    & $add '--- 无线 ---'
+    $ssidNow = ''
+    try {
+        $w = Get-WifiInfo
+        $ssidNow = [string]$w.Ssid
+        & $add ('当前: ' + $(if ($w.Ssid) { $w.Ssid } else { '(未连接)' }) + '   状态 ' + $w.State + '   目标 ' + $WifiSsid)
+        & $add ('网卡: ' + $w.Interface)
+    } catch { & $add ('无线读取失败: ' + $_.Exception.Message) }
+    try {
+        $nets = @((Update-WifiList).Visible | ForEach-Object { [string]$_.Ssid } | Where-Object { $_ })
+        if ($nets.Count) { & $add ('可见网络: ' + (($nets | Select-Object -First 12) -join ' , ')) }
+    } catch { }
+
+    # ---- 地址 ----
+    & $add ''
+    & $add '--- 地址 ---'
+    try {
+        $cfg = @(Get-NetIPConfiguration -ErrorAction Stop | Where-Object { $_.IPv4DefaultGateway }) | Select-Object -First 1
+        if ($cfg) {
+            & $add ('IP: ' + (@($cfg.IPv4Address)[0]).IPAddress + '   网关: ' + $cfg.IPv4DefaultGateway.NextHop)
+            $dns = @($cfg.DNSServer | Where-Object { $_.AddressFamily -eq 2 } | ForEach-Object { $_.ServerAddresses } | Where-Object { $_ })
+            if ($dns.Count) { & $add ('DNS: ' + ($dns -join ' , ')) }
+        } else { & $add '没有默认网关(可能没连上)' }
+    } catch { & $add ('地址读取失败: ' + $_.Exception.Message) }
+    if ($script:ProxyEnvHit -and $script:ProxyEnvHit.Count -gt 0) {
+        & $add ('代理变量: ' + ($script:ProxyEnvHit -join ' , ') + '   (已忽略)')
+    } else { & $add '代理变量: 无' }
+
+    # ---- 连通性 / 门户探测 ----
+    & $add ''
+    & $add '--- 探测 ---'
+    $ns = Get-NetStatus
+    & $add ('联网判定: ' + $(if ($ns.Online) { '在线' } elseif ($ns.Hijacked) { '被劫持' } else { '不通' }) + ' — ' + $ns.Detail)
+
+    $cap = Get-CaptiveRedirect
+    & $add ('HTTP 302 门户: ' + $(if ($cap) { $cap } else { '(没抓到)' }))
+
+    $gw = Get-DefaultGatewayIp
+    if ($gw) {
+        foreach ($gu in @(('http://' + $gw + '/'), ('http://' + $gw + ':8080/'))) {
+            $gc = ''
+            try { $gc = ((& $Curl -s -o NUL -A $UA -w '%{http_code}' --max-time 4 $gu 2>$null) -join '').Trim() } catch { }
+            & $add ('网关 ' + $gu + ' → HTTP ' + $gc)
+        }
+    }
+
+    $hh = Get-HttpsPortalHint
+    if ($hh) {
+        & $add ('HTTPS 劫持页: ' + $hh.Title + '   (' + $hh.Size + ' 字节, HTTP ' + $hh.Code + ')')
+        if ($hh.Hosts.Count -gt 0) { & $add ('  页面里的域名: ' + ($hh.Hosts -join ' , ')) }
+    } else {
+        & $add 'HTTPS 劫持页: 没抓到(可能没被拦,或者已经在线)'
+    }
+
+    $fp = Get-PortalFingerprint $cap
+    & $add ('识别: ' + $fp.Vendor + $(if ($fp.Id) { '(' + $fp.Id + ')' } else { '' }))
+    $carrier = Get-CarrierHint -Url $cap -Ssid $ssidNow
+    & $add ('运营商线索: ' + $(if ($carrier) { $carrier } else { '无' }))
+
+    # ---- 门户页 + 同站脚本 ----
+    & $add ''
+    & $add '--- 门户页采集 ---'
+    $targets = @()
+    if ($cap) { $targets += $cap }
+    if ($gw) { $targets += ('http://' + $gw + '/') }
+    if ($hh) { foreach ($hv in $hh.Hosts) { $targets += ('http://' + $hv + '/') } }
+    # 兜底:当前配置里的门户也试一下,顺手证明它通不通
+    $targets += ('http://' + $PortalHost + '/')
+    if ($targets.Count -eq 0) { $targets = @('http://' + $PortalHost + '/') }
+
+    try { if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null } } catch { }
+    $saved = 0
+    foreach ($t in ($targets | Select-Object -Unique)) {
+        if ($saved -ge 2) { break }
+        if ($t -notmatch '^https?://') { continue }
+        $base = ''
+        try { $u = [uri]$t; $base = $u.Scheme + '://' + $u.Authority } catch { continue }
+
+        $outFn = Join-Path $dir ('portal-' + ($saved + 1) + '.html')
+        $code = ''
+        $eff = $t
+        try {
+            $meta = ((& $Curl -sk -L -A $UA --max-time 10 -o $outFn -w '%{http_code}|%{url_effective}' $t 2>$null) -join '').Trim()
+            $mp = $meta -split '\|', 2
+            $code = $mp[0]
+            if ($mp.Count -gt 1 -and $mp[1] -match '^https?://') { $eff = [string]$mp[1] }
+        } catch { }
+        if (-not $code -or $code -eq '000' -or -not (Test-Path $outFn)) {
+            & $add ($t + ' → HTTP ' + $code + '  抓不到')
+            continue
+        }
+        $html = ''
+        try { $html = [System.IO.File]::ReadAllText($outFn, [System.Text.Encoding]::UTF8) } catch { }
+        if (-not $html) { & $add ($t + ' → HTTP ' + $code + '  空页面'); continue }
+
+        # 相对路径要按「最终地址」解析,不然 ../share/x.js 会拼错
+        $baseUrl = $eff
+        try { $bu = [uri]$eff; $base = $bu.Scheme + '://' + $bu.Authority } catch { }
+
+        $title = ''
+        if ($html -match '<title>([^<]{1,80})</title>') { $title = $Matches[1].Trim() }
+        & $add ($t + ' → HTTP ' + $code + ' , ' + $html.Length + ' 字节 , ' + $(if ($title) { '标题「' + $title + '」' } else { '没有标题' }))
+        $saved++
+
+        # 门户的登录逻辑基本都在同站 JS 里,一起取回来
+        $jsList = @()
+        foreach ($m in [regex]::Matches($html, '(?:src|href)\s*=\s*["'']([^"'']+\.js[^"'']*)["'']')) {
+            $src = $m.Groups[1].Value
+            if ($src -match '^(data:|javascript:)') { continue }
+            $full = $src
+            if ($src -notmatch '^https?://') {
+                # 用「最终地址」做基准解析,才不会把 ../share/xxx.js 拼错路径
+                try { $full = ([Uri]::new([Uri]$baseUrl, $src)).AbsoluteUri }
+                catch { $full = $base.TrimEnd('/') + '/' + $src.TrimStart('/') }
+            }
+            if ($full -like ($base + '*')) { if ($jsList -notcontains $full) { $jsList += $full } }
+        }
+        $ji = 0
+        foreach ($js in ($jsList | Select-Object -First 8)) {
+            $ji++
+            $fn = Join-Path $dir ('script-' + $saved + '-' + $ji + '.js')
+            try { & $Curl -sk -s -A $UA --max-time 8 -o $fn $js 2>$null | Out-Null } catch { }
+            if (Test-Path $fn) {
+                $sz = (Get-Item $fn).Length
+                if ($sz -gt 0) { & $add ('  脚本: ' + (Split-Path $js -Leaf) + '  ' + $sz + ' 字节') }
+                else { Remove-Item $fn -Force -ErrorAction SilentlyContinue }
+            }
+        }
+        if ($jsList.Count -gt 8) { & $add ('  (脚本太多,只取了前 8 个)') }
+    }
+    if ($saved -eq 0) { & $add '一个门户页都没抓到(门户可能只在内网特定条件下才开放)' }
+
+    # ---- 打包 ----
+    $zip = ''
+    if (-not $NoZip) {
+        try {
+            $files = @(Get-ChildItem $dir -File -ErrorAction SilentlyContinue)
+            if ($files.Count -gt 0) {
+                Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+                $zip = Join-Path $WorkDir ('collect-' + $stamp + '.zip')
+                if (Test-Path $zip) { Remove-Item $zip -Force }
+                [System.IO.Compression.ZipFile]::CreateFromDirectory($dir, $zip, [System.IO.Compression.CompressionLevel]::Optimal, $false)
+            }
+        } catch { $zip = ''; & $add ('打包失败: ' + $_.Exception.Message) }
+    }
+
+    # ---- 收尾 ----
+    & $add ''
+    & $add '--- 怎么发回来 ---'
+    & $add '1) 上面这些文字已经自动复制到剪贴板,直接粘贴到聊天窗口发出去'
+    & $add '2) 同目录下的 collect-<时间>.zip 一起发(里面是门户页和它的 JS,用来还原登录接口)'
+    & $add '3) 浏览器弹认证页时,把地址栏那一行也随手截个图'
+    if ($zip) { & $add ('压缩包: ' + $zip) }
+
+    $text = ($lines -join "`r`n")
+    $txtPath = Join-Path $WorkDir ('collect-' + $stamp + '.txt')
+    try { Set-Content -Path $txtPath -Value $text -Encoding UTF8 } catch { }
+    try { Set-Clipboard -Value $text } catch { }
+
+    Write-Stdout ''
+    Write-Stdout $text
+    Write-Stdout ''
+    Write-Stdout ('报告文本: ' + $txtPath)
+    if ($zip) { Write-Stdout ('压缩包:   ' + $zip) }
+    Write-Stdout ''
+    Write-Stdout '↑ 文本已经复制到剪贴板,直接粘贴发出去就行'
+}
+
 # ================= 诊断 =================
 function Add-DoctorItem {
     param($List, [string]$Name, [string]$Level, [string]$Detail)
@@ -5204,6 +5391,7 @@ function Show-Menu {
         Write-Stdout '  O) 门户类型 / 通用认证配置'
         $curProto = [string](Get-PortalProfile).name
         Write-Stdout ('       (当前: ' + $curProto + ')')
+        Write-Stdout '  C) 采集诊断包(远程排查用,自动复制到剪贴板)'
         Write-Stdout '  L) 查看日志'
         Write-Stdout '  0) 退出'
         Write-Stdout '=================================================='
@@ -5288,6 +5476,7 @@ function Show-Menu {
                 }
             }
             'L' { Show-Log }
+            'C' { Invoke-Collect }
             '0' { return }
             default { Write-Stdout '无效选择' }
         }
@@ -5339,6 +5528,7 @@ switch ($Mode) {
     'install'   { if (-not (Invoke-Install)) { exit 1 } }
     'uninstall' { Invoke-Uninstall }
     'log'       { Show-Log }
+    'collect'   { Invoke-Collect; exit 0 }
     'synctime'  { [void](Sync-Clock -Always) }
 
     'wifi'      { if (Test-WifiConnected -Ssid $WifiSsid) { exit 0 } else { exit 1 } }
