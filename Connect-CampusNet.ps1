@@ -4253,6 +4253,19 @@ function Sync-PetMenuChecks {
     }
 }
 
+function Test-PetMenuPoint {
+    # 鼠标点是不是落在菜单里(含所有还开着的二级 / 三级菜单)
+    param($Menu, [System.Drawing.Point]$P)
+    if (-not $Menu.Visible) { return $false }
+    if ($Menu.Bounds.Contains($P)) { return $true }
+    foreach ($it in @($Menu.Items)) {
+        if ($it -is [System.Windows.Forms.ToolStripDropDownItem] -and $it.DropDown.Visible) {
+            if (Test-PetMenuPoint -Menu $it.DropDown -P $P) { return $true }
+        }
+    }
+    return $false
+}
+
 function New-PetMenu {
     $menu = New-Object System.Windows.Forms.ContextMenuStrip
     # 勾选状态统一用这一份快照,免得每个选项都去读一遍 settings.json
@@ -4712,19 +4725,24 @@ function Start-Pet {
             } catch { }
         })
     # 点菜单外面自动关闭(窗口 TopMost 且没有焦点时,默认行为常常不收起)
+    # 关键:必须等「松手」再判断。按下就收会把二级菜单里的点击吃掉 ——
+    # 帧率 / 大小 / 信息框 / 动作 / 随机间隔 / 碎碎念 全在二级菜单里,
+    # 以前这些项点了完全没反应(日志里连一行「宠物帧率:48Hz」都没有)就是这个原因。
     $script:PetMenuGuard = New-Object System.Windows.Forms.Timer
     $script:PetMenuGuard.Interval = 40
     $script:PetMenuGuard.add_Tick({
-            if (-not $script:PetMenu -or -not $script:PetMenu.Visible) { $script:PetMenuGuard.Stop(); return }
+            if (-not $script:PetMenu -or -not $script:PetMenu.Visible) { $script:PetMenuGuard.Stop(); $script:PetMenuDown = $false; return }
             $btn = [System.Windows.Forms.Control]::MouseButtons
-            if ($btn -eq [System.Windows.Forms.MouseButtons]::None) { return }
+            if ($btn -ne [System.Windows.Forms.MouseButtons]::None) { $script:PetMenuDown = $true; return }
+            if (-not $script:PetMenuDown) { return }
+            $script:PetMenuDown = $false
             $cp = [System.Windows.Forms.Cursor]::Position
-            if (-not $script:PetMenu.Bounds.Contains($cp)) {
+            if (-not (Test-PetMenuPoint -Menu $script:PetMenu -P $cp)) {
                 $script:PetMenu.Close()
                 $script:PetMenuGuard.Stop()
             }
         })
-    $script:PetMenu.add_Opened({ $script:PetMenuGuard.Start() })
+    $script:PetMenu.add_Opened({ $script:PetMenuDown = $false; $script:PetMenuGuard.Start() })
     $script:PetMenu.add_Closed({ $script:PetMenuGuard.Stop() })
     $form.add_MouseEnter({
             $script:PetHover = $true
