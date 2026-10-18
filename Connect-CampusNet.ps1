@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
 .SYNOPSIS
     校园网自动登录 —— 菜单 / 托盘 / 开机自启 / 后台守护 / 多账号
@@ -103,7 +103,7 @@ $VbsFile    = Join-Path $WorkDir 'run-hidden.vbs'
 $TaskName   = 'CampusNet-AutoLogin'
 $RepairTaskName = 'CampusNet-Repair'
 $UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-$script:AppVersion = '1.2.1'
+$script:AppVersion = '1.2.2'
 $Curl = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
 $script:NicList = $null
 $script:NicListAt = [datetime]::MinValue
@@ -135,6 +135,8 @@ function Get-Settings {
         petOverlayW     = 0
         petOverlayH     = 0
         petFps          = 60
+        petModel        = 'dsh-pet'
+        petVariant      = 'default'
         petSayEvery     = 6
         petSayDur       = 0
         petOverlayFont  = 9.5
@@ -167,6 +169,8 @@ function Get-Settings {
         if (-not $s.PSObject.Properties['petOverlayW']) { $s | Add-Member -NotePropertyName petOverlayW -NotePropertyValue 0 -Force }
         if (-not $s.PSObject.Properties['petOverlayH']) { $s | Add-Member -NotePropertyName petOverlayH -NotePropertyValue 0 -Force }
         if (-not $s.PSObject.Properties['petFps']) { $s | Add-Member -NotePropertyName petFps -NotePropertyValue 60 -Force }
+        if (-not $s.PSObject.Properties['petModel']) { $s | Add-Member -NotePropertyName petModel -NotePropertyValue 'dsh-pet' -Force }
+        if (-not $s.PSObject.Properties['petVariant']) { $s | Add-Member -NotePropertyName petVariant -NotePropertyValue 'default' -Force }
         if (-not $s.PSObject.Properties['petSayEvery']) { $s | Add-Member -NotePropertyName petSayEvery -NotePropertyValue 6 -Force }
         if (-not $s.PSObject.Properties['petSayDur']) { $s | Add-Member -NotePropertyName petSayDur -NotePropertyValue 0 -Force }
         if (-not $s.PSObject.Properties['petOverlayFont'] -or [double]$s.petOverlayFont -le 0) { $s | Add-Member -NotePropertyName petOverlayFont -NotePropertyValue 9.5 -Force }
@@ -202,6 +206,8 @@ function Save-Settings {
         petOverlayW     = [int]$(if ($Settings.petOverlayW) { $Settings.petOverlayW } else { 0 })
         petOverlayH     = [int]$(if ($Settings.petOverlayH) { $Settings.petOverlayH } else { 0 })
         petFps          = [int]$(if ($Settings.petFps) { $Settings.petFps } else { 60 })
+        petModel        = [string]$(if ($Settings.petModel) { $Settings.petModel } else { 'dsh-pet' })
+        petVariant      = [string]$(if ($Settings.petVariant) { $Settings.petVariant } else { 'default' })
         petSayEvery     = [int]$(if ($null -ne $Settings.petSayEvery) { $Settings.petSayEvery } else { 6 })
         petSayDur       = [double]$(if ($null -ne $Settings.petSayDur) { $Settings.petSayDur } else { 0 })
         petOverlayFont  = [double]$(if ($Settings.petOverlayFont) { $Settings.petOverlayFont } else { 9.5 })
@@ -2704,6 +2710,12 @@ function Invoke-Repair {
 # 这里的做法:构建时把 webm 抠图(含去黑边)+ 按 24fps 逐帧导出 PNG,
 # 运行时用 GDI 分层窗口(UpdateLayeredWindow)直接画在**已有的托盘进程**里。
 $script:PetDir    = Join-Path $WorkDir 'pet'
+# 内置模型就是 pet/ 本身;额外模型包放在 pet/models/<包名>/(各带一份 pet.json)
+$script:PetBaseDir = $script:PetDir
+$script:PetModelsDir = Join-Path $script:PetBaseDir 'models'
+$script:PetModelId = ''
+$script:PetVariantId = 'default'
+$script:PetTint   = $null
 $script:PetUrl    = 'https://github.com/PC2005-cloud/dsh-pet'
 $script:PetCache  = @{}          # 动作 -> @{ Hbs; W; H; Count }
 $script:PetForm   = $null
@@ -2864,6 +2876,183 @@ namespace CampusNetPet {
 }
 '@
 
+# ---------- 模型包 / 配色变体 ----------
+function Get-PetModels {
+    # 内置模型 = pet/ 本身;额外模型包 = pet/models/<包名>/(各带一份 pet.json)。
+    # 同一个包可以在 pet.json 里写多套配色(variants),配色只是颜色矩阵,不额外占磁盘。
+    $out = New-Object System.Collections.ArrayList
+    $add = {
+        param($dir, $id)
+        $man = Join-Path $dir 'pet.json'
+        if (-not (Test-Path $man)) { return }
+        $m = $null
+        try { $m = [System.IO.File]::ReadAllText($man, [System.Text.Encoding]::UTF8) | ConvertFrom-Json } catch { return }
+        if (-not $m) { return }
+        $packName = $(if ($m.name) { [string]$m.name } else { $id })
+        $vars = @($m.variants)
+        if ($vars.Count -eq 0) { $vars = @([pscustomobject]@{ id = 'default'; name = '原色' }) }
+        foreach ($v in $vars) {
+            $vn = $(if ($v.name) { [string]$v.name } else { [string]$v.id })
+            $label = $(if ($vars.Count -gt 1) { $packName + ' · ' + $vn } else { $packName })
+            [void]$out.Add([pscustomobject]@{
+                    Id          = $id
+                    Variant     = $(if ($v.id) { [string]$v.id } else { 'default' })
+                    Name        = $packName
+                    VariantName = $vn
+                    Label       = $label
+                    Dir         = $dir
+                    Manifest    = $m
+                    Filters     = $v.filters
+                })
+        }
+    }
+    & $add $script:PetBaseDir 'dsh-pet'
+    if (Test-Path $script:PetModelsDir) {
+        foreach ($d in (Get-ChildItem -LiteralPath $script:PetModelsDir -Directory -ErrorAction SilentlyContinue | Sort-Object Name)) {
+            & $add $d.FullName $d.Name
+        }
+    }
+    return @($out)
+}
+
+function Resolve-PetModel {
+    # 把设置里的 petModel / petVariant 解析成真实目录 + 颜色矩阵;解析不到就退回第一套
+    $all = @(Get-PetModels)
+    if ($all.Count -eq 0) {
+        $script:PetDir = $script:PetBaseDir
+        $script:PetTint = $null
+        return $null
+    }
+    $id = [string](Get-PetSetting -Name 'petModel' -Default 'dsh-pet')
+    $vd = [string](Get-PetSetting -Name 'petVariant' -Default 'default')
+    $pick = @($all | Where-Object { $_.Id -eq $id -and $_.Variant -eq $vd })[0]
+    if (-not $pick) { $pick = @($all | Where-Object { $_.Id -eq $id })[0] }
+    if (-not $pick) { $pick = $all[0] }
+    $script:PetModelId = $pick.Id
+    $script:PetVariantId = $pick.Variant
+    $script:PetDir = $pick.Dir
+    $script:PetManifest = $pick.Manifest
+    $script:PetUrl = $(if ($pick.Manifest.source) { [string]$pick.Manifest.source } else { $script:PetUrl })
+    if ($pick.Filters) { $script:PetTint = New-PetFilterMatrix -Filters $pick.Filters }
+    else { $script:PetTint = $null }
+    return $pick
+}
+
+function Set-PetModel {
+    # 换模型:清缓存 → 换目录/矩阵 → 原地重启宠物(位置和大小都保留)
+    param([string]$Id, [string]$Variant = '')
+    $all = @(Get-PetModels)
+    $pick = @($all | Where-Object { $_.Id -eq $Id -and $_.Variant -eq $Variant })[0]
+    if (-not $pick) { $pick = @($all | Where-Object { $_.Id -eq $Id })[0] }
+    if (-not $pick) {
+        Write-Log ('没有这个模型:' + $Id + '/' + $Variant) 'WARN'
+        return $false
+    }
+    $wasOn = [bool]($script:PetForm -and -not $script:PetForm.IsDisposed)
+    $x = [int]$script:PetX
+    $y = [int]$script:PetY
+    if ($wasOn) { Stop-Pet }
+    try {
+        $s = Get-Settings
+        $s.petModel = $pick.Id
+        $s.petVariant = $pick.Variant
+        if ($x -gt 0 -and $y -gt 0) { $s.petX = $x; $s.petY = $y }
+        Save-Settings -Settings $s
+    } catch { }
+    $script:PetManifest = $null
+    $null = Resolve-PetModel
+    if ($wasOn) {
+        if ($x -gt 0 -and $y -gt 0) { $script:PetX = $x; $script:PetY = $y }
+        [void](Start-Pet)
+    }
+    Write-Log ('切换模型:' + $pick.Label + '(' + $pick.Id + '/' + $pick.Variant + ')') 'OK'
+    return $true
+}
+
+function Multiply-Matrix3 {
+    param([double[]]$A, [double[]]$B)
+    $r = New-Object 'double[]' 9
+    for ($i = 0; $i -lt 3; $i++) {
+        for ($j = 0; $j -lt 3; $j++) {
+            $sum = 0.0
+            for ($k = 0; $k -lt 3; $k++) { $sum += $A[$i * 3 + $k] * $B[$k * 3 + $j] }
+            $r[$i * 3 + $j] = $sum
+        }
+    }
+    return $r
+}
+
+function New-PetFilterMatrix {
+    # pet.json 的 filters:{"hue":角度,"saturate":倍数,"bright":倍数} → ColorMatrix(alpha 不动)
+    param($Filters)
+    if (-not $Filters) { return $null }
+    $hue = 0.0; $sat = 1.0; $bri = 1.0
+    foreach ($p in $Filters.PSObject.Properties) {
+        switch ($p.Name) {
+            'hue' { $hue = [double]$p.Value }
+            'saturate' { $sat = [double]$p.Value }
+            'bright' { $bri = [double]$p.Value }
+        }
+    }
+    if ([Math]::Abs($hue) -lt 0.01 -and [Math]::Abs($sat - 1) -lt 0.001 -and [Math]::Abs($bri - 1) -lt 0.001) { return $null }
+    $m = @(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    if ([Math]::Abs($sat - 1) -gt 0.001) {
+        $rw = 0.213; $gw = 0.715; $bw = 0.072
+        # GDI+ 的 ColorMatrix 按「行 = 输入通道、列 = 输出通道」用(out = in × M),
+        # 所以饱和度矩阵要把亮度权重放进每一行,写反会得到「灰阶变绿」。
+        $s3 = @(
+            ($rw * (1 - $sat) + $sat), ($rw * (1 - $sat)), ($rw * (1 - $sat)),
+            ($gw * (1 - $sat)), ($gw * (1 - $sat) + $sat), ($gw * (1 - $sat)),
+            ($bw * (1 - $sat)), ($bw * (1 - $sat)), ($bw * (1 - $sat) + $sat)
+        )
+        $m = Multiply-Matrix3 $s3 $m
+    }
+    if ([Math]::Abs($hue) -gt 0.01) {
+        # 负号:这张色相矩阵在 GDI+ 行向量约定下方向相反(实测 hue=+120 会把红转成蓝)
+        $rad = -$hue * [Math]::PI / 180.0
+        $c = [Math]::Cos($rad); $s2 = [Math]::Sin($rad)
+        $h3 = @(
+            (0.213 + $c * 0.787 - $s2 * 0.213), (0.715 - $c * 0.715 - $s2 * 0.715), (0.072 - $c * 0.072 + $s2 * 0.928),
+            (0.213 - $c * 0.213 + $s2 * 0.143), (0.715 + $c * 0.285 + $s2 * 0.140), (0.072 - $c * 0.072 - $s2 * 0.283),
+            (0.213 - $c * 0.213 - $s2 * 0.787), (0.715 - $c * 0.715 + $s2 * 0.715), (0.072 + $c * 0.928 + $s2 * 0.072)
+        )
+        $m = Multiply-Matrix3 $h3 $m
+    }
+    if ([Math]::Abs($bri - 1) -gt 0.001) {
+        $b3 = @($bri, 0.0, 0.0, 0.0, $bri, 0.0, 0.0, 0.0, $bri)
+        $m = Multiply-Matrix3 $b3 $m
+    }
+    $cm = New-Object System.Drawing.Imaging.ColorMatrix
+    $cm.Matrix00 = [single]$m[0]; $cm.Matrix01 = [single]$m[1]; $cm.Matrix02 = [single]$m[2]
+    $cm.Matrix10 = [single]$m[3]; $cm.Matrix11 = [single]$m[4]; $cm.Matrix12 = [single]$m[5]
+    $cm.Matrix20 = [single]$m[6]; $cm.Matrix21 = [single]$m[7]; $cm.Matrix22 = [single]$m[8]
+    return $cm
+}
+
+function Apply-PetTint {
+    # 把颜色矩阵烘进帧(载入时做一次,播放时零开销)
+    param($Bitmap, $Matrix)
+    if (-not $Bitmap -or -not $Matrix) { return $Bitmap }
+    $w = $Bitmap.Width; $h = $Bitmap.Height
+    $out = $null
+    try {
+        $out = New-Object System.Drawing.Bitmap -ArgumentList $w, $h, ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+        $g = [System.Drawing.Graphics]::FromImage($out)
+        $g.CompositingMode = [System.Drawing.Drawing2D.CompositingMode]::SourceCopy
+        $g.Clear([System.Drawing.Color]::Transparent)
+        $ia = New-Object System.Drawing.Imaging.ImageAttributes
+        $ia.SetColorMatrix($Matrix)
+        $rect = New-Object System.Drawing.Rectangle -ArgumentList 0, 0, $w, $h
+        $g.DrawImage($Bitmap, $rect, 0, 0, $w, $h, [System.Drawing.GraphicsUnit]::Pixel, $ia)
+        $ia.Dispose(); $g.Dispose()
+        $Bitmap.Dispose()
+        return $out
+    } catch {
+        if ($out) { try { $out.Dispose() } catch { } }
+        return $Bitmap
+    }
+}
+
 function Test-PetAssets {
     if (-not (Test-Path (Join-Path $script:PetDir 'idle'))) { return $false }
     return $true
@@ -2946,7 +3135,7 @@ function Get-PetFrames {
 
     if ($Scale -lt 0.5) { $Scale = 0.5 }
     if ($Scale -gt 2.0) { $Scale = 2.0 }
-    $key = ('{0}@{1:N2}' -f $Anim, $Scale)
+    $key = ('{0}@{1:N2}@{2}@{3}' -f $Anim, $Scale, $script:PetModelId, $script:PetVariantId)
     if ($script:PetCache.ContainsKey($key)) { return $script:PetCache[$key] }
 
     $dir = Join-Path $script:PetDir $Anim
@@ -2998,6 +3187,8 @@ function Get-PetFrames {
                 $raw.Dispose()
                 $bmp = $scaled
             }
+            # 配色变体:把颜色矩阵烘进帧,播放时零开销
+            if ($script:PetTint) { $bmp = Apply-PetTint -Bitmap $bmp -Matrix $script:PetTint }
             if ($w -eq 0) { $w = $bmp.Width; $h = $bmp.Height }
 
             # 上一帧和这一帧之间插一张(顺序:帧0 → 混合 → 帧1 → …)
@@ -4285,6 +4476,9 @@ function Sync-PetMenuChecks {
                 if ($nm -eq 'petOverlayWH') {
                     $p2 = @(([string]$it.PetCheckValue) -split ',')
                     $it.Checked = ([int]$Snapshot.petOverlayW -eq [int]$p2[0] -and [int]$Snapshot.petOverlayH -eq [int]$p2[1])
+                } elseif ($nm -eq 'petModelPair') {
+                    # 模型是「包 id|配色 id」两段值
+                    $it.Checked = ([string]$it.PetCheckValue -eq ([string]$Snapshot.petModel + '|' + [string]$Snapshot.petVariant))
                 } else {
                     $cur = $it.PetCheckValue
                     if ($Snapshot.PSObject.Properties[$nm]) { $cur = $Snapshot.PSObject.Properties[$nm].Value }
@@ -4314,11 +4508,47 @@ function Test-PetMenuPoint {
     return $false
 }
 
+function Add-PetModelItems {
+    # 模型子菜单:每个包的每套配色一项,当前那套打勾
+    param($Parent, $Snapshot)
+    $models = @(Get-PetModels)
+    if ($models.Count -eq 0) {
+        $miNone = New-Object System.Windows.Forms.ToolStripMenuItem
+        $miNone.Text = '(没有找到模型包)'
+        $miNone.Enabled = $false
+        [void]$Parent.DropDownItems.Add($miNone)
+    } else {
+        foreach ($m in $models) {
+            $mi = New-Object System.Windows.Forms.ToolStripMenuItem
+            $mi.Text = [string]$m.Label
+            $mi.Tag = ([string]$m.Id + '|' + [string]$m.Variant)
+            Set-PetMenuCheck -Item $mi -Name 'petModelPair' -Value ([string]$mi.Tag) -Tol 0 -Snapshot $Snapshot
+            $mi.add_Click({
+                    param($sender, $e)
+                    $parts = @(([string]$sender.Tag) -split '\|')
+                    [void](Set-PetModel -Id $parts[0] -Variant $parts[1])
+                })
+            [void]$Parent.DropDownItems.Add($mi)
+        }
+    }
+    [void]$Parent.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+    $miDir = New-Object System.Windows.Forms.ToolStripMenuItem
+    $miDir.Text = '打开模型目录…'
+    $miDir.add_Click({ Start-Process $script:PetModelsDir })
+    [void]$Parent.DropDownItems.Add($miDir)
+}
+
 function New-PetMenu {
     $menu = New-Object System.Windows.Forms.ContextMenuStrip
     # 勾选状态统一用这一份快照,免得每个选项都去读一遍 settings.json
     $snap = $null
     try { $snap = Get-Settings } catch { }
+
+    # 模型(放最上面:这是最想点的东西)
+    $miModel = New-Object System.Windows.Forms.ToolStripMenuItem
+    $miModel.Text = '模型'
+    Add-PetModelItems -Parent $miModel -Snapshot $snap
+    [void]$menu.Items.Add($miModel)
 
     $miActions = New-Object System.Windows.Forms.ToolStripMenuItem
     $miActions.Text = '动作'
@@ -4718,6 +4948,8 @@ function Start-Pet {
     param([switch]$Quiet)
 
     if ($script:PetForm -and -not $script:PetForm.IsDisposed) { return $true }
+    # 按设置里的 petModel / petVariant 解析出实际素材目录 + 配色矩阵
+    $null = Resolve-PetModel
     if (-not (Test-PetAssets)) {
         Write-Log ('没有宠物素材(缺 ' + (Join-Path $script:PetDir 'idle') + '),跳过') 'WARN'
         return $false
@@ -4900,7 +5132,7 @@ function Start-Pet {
     if (-not $Quiet) {
         $anims = @(Get-PetAnimList | Where-Object { $_.id -notin @('idle', 'sleep', 'walk') }).Count
         $memes = @(Get-PetMemeList).Count
-        Write-Log ('桌面宠物已启动(' + $w + 'x' + $h + ',' + $fpsWant + 'Hz(素材 ' + (Get-PetFps) + 'fps),' + $anims + ' 个动作,' + $memes + ' 张表情包,素材:' + $script:PetUrl + ')') 'OK'
+        Write-Log ('桌面宠物已启动(模型 ' + $script:PetModelId + '/' + $script:PetVariantId + ',' + $w + 'x' + $h + ',' + $fpsWant + 'Hz(素材 ' + (Get-PetFps) + 'fps),' + $anims + ' 个动作,' + $memes + ' 张表情包,素材:' + $script:PetUrl + ')') 'OK'
     }
     return $true
 }
@@ -5268,6 +5500,11 @@ function Invoke-Tray {
                     -Actions @('打开菜单|campusnet:menu', '立即登录|campusnet:login'))
         })
     [void]$menu.Items.Add($itemNotifyTest)
+
+    $itemPetModel = New-Object System.Windows.Forms.ToolStripMenuItem
+    $itemPetModel.Text = '桌宠模型'
+    Add-PetModelItems -Parent $itemPetModel -Snapshot $null
+    [void]$menu.Items.Add($itemPetModel)
 
     $itemPet = New-Object System.Windows.Forms.ToolStripMenuItem
     $itemPet.Text = '桌面宠物: ' + $(if ((Get-Settings).pet) { '开' } else { '关' })

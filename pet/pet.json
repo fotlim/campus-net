@@ -268,5 +268,36 @@
                       "w":  300,
                       "h":  291
                   }
-              ]
+              ],
+    "name":  "蓝色女仆(dsh-pet)",
+    "author":  "PC2005-cloud",
+    "variants":  [
+                     {
+                         "id":  "default",
+                         "name":  "原色"
+                     },
+                     {
+                         "id":  "night",
+                         "name":  "夜色",
+                         "filters":  {
+                                         "bright":  0.75,
+                                         "saturate":  0.85
+                                     }
+                     },
+                     {
+                         "id":  "vivid",
+                         "name":  "浓彩",
+                         "filters":  {
+                                         "saturate":  1.5
+                                     }
+                     },
+                     {
+                         "id":  "mono",
+                         "name":  "墨白",
+                         "filters":  {
+                                         "saturate":  0,
+                                         "bright":  1.05
+                                     }
+                     }
+                 ]
 }
