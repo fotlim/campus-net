@@ -103,7 +103,7 @@ $VbsFile    = Join-Path $WorkDir 'run-hidden.vbs'
 $TaskName   = 'CampusNet-AutoLogin'
 $RepairTaskName = 'CampusNet-Repair'
 $UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-$script:AppVersion = '1.1.6'
+$script:AppVersion = '1.1.7'
 $Curl = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
 $script:NicList = $null
 $script:NicListAt = [datetime]::MinValue
@@ -134,6 +134,7 @@ function Get-Settings {
         caiyunToken     = ''
         petOverlayW     = 0
         petOverlayH     = 0
+        petFps          = 60
         petOverlayFont  = 9.5
         petOverlayOpacity = 0.94
     }
@@ -163,6 +164,7 @@ function Get-Settings {
         if (-not $s.PSObject.Properties['caiyunToken']) { $s | Add-Member -NotePropertyName caiyunToken -NotePropertyValue '' -Force }
         if (-not $s.PSObject.Properties['petOverlayW']) { $s | Add-Member -NotePropertyName petOverlayW -NotePropertyValue 0 -Force }
         if (-not $s.PSObject.Properties['petOverlayH']) { $s | Add-Member -NotePropertyName petOverlayH -NotePropertyValue 0 -Force }
+        if (-not $s.PSObject.Properties['petFps']) { $s | Add-Member -NotePropertyName petFps -NotePropertyValue 60 -Force }
         if (-not $s.PSObject.Properties['petOverlayFont'] -or [double]$s.petOverlayFont -le 0) { $s | Add-Member -NotePropertyName petOverlayFont -NotePropertyValue 9.5 -Force }
         if (-not $s.PSObject.Properties['petOverlayOpacity'] -or [double]$s.petOverlayOpacity -le 0) { $s | Add-Member -NotePropertyName petOverlayOpacity -NotePropertyValue 0.94 -Force }
         return $s
@@ -195,6 +197,7 @@ function Save-Settings {
         caiyunToken     = [string]$Settings.caiyunToken
         petOverlayW     = [int]$(if ($Settings.petOverlayW) { $Settings.petOverlayW } else { 0 })
         petOverlayH     = [int]$(if ($Settings.petOverlayH) { $Settings.petOverlayH } else { 0 })
+        petFps          = [int]$(if ($Settings.petFps) { $Settings.petFps } else { 60 })
         petOverlayFont  = [double]$(if ($Settings.petOverlayFont) { $Settings.petOverlayFont } else { 9.5 })
         petOverlayOpacity = [double]$(if ($Settings.petOverlayOpacity) { $Settings.petOverlayOpacity } else { 0.94 })
     } | ConvertTo-Json | Set-Content -Path $SettingsFn -Encoding UTF8
@@ -2897,6 +2900,37 @@ function Get-PetLabel {
     return $Id
 }
 
+function Merge-PetBitmap {
+    # 两张同尺寸帧线性混合(0.5 就是中间帧),用来把 24fps 素材插成 48fps
+    param($A, $B, [double]$Alpha = 0.5)
+    if (-not $A -or -not $B) { return $null }
+    if ($A.Width -ne $B.Width -or $A.Height -ne $B.Height) { return $null }
+    $w = $A.Width; $h = $A.Height
+    $out = $null
+    try {
+        $out = New-Object System.Drawing.Bitmap -ArgumentList $w, $h, ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+        $g = [System.Drawing.Graphics]::FromImage($out)
+        $g.CompositingMode = [System.Drawing.Drawing2D.CompositingMode]::SourceCopy
+        $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+        $g.Clear([System.Drawing.Color]::Transparent)
+        $g.DrawImage($A, 0, 0, $w, $h)
+
+        $g.CompositingMode = [System.Drawing.Drawing2D.CompositingMode]::SourceOver
+        $ia = New-Object System.Drawing.Imaging.ImageAttributes
+        $cm = New-Object System.Drawing.Imaging.ColorMatrix
+        $cm.Matrix33 = [single]$Alpha
+        $ia.SetColorMatrix($cm)
+        $rect = New-Object System.Drawing.Rectangle -ArgumentList 0, 0, $w, $h
+        $g.DrawImage($B, $rect, 0, 0, $w, $h, [System.Drawing.GraphicsUnit]::Pixel, $ia)
+        $ia.Dispose()
+        $g.Dispose()
+        return $out
+    } catch {
+        if ($out) { try { $out.Dispose() } catch { } }
+        return $null
+    }
+}
+
 function Get-PetFrames {
     # 按缩放比例缓存:key = "动作@比例"。换大小只会重新解码当前动作,不影响别的
     param([string]$Anim, [double]$Scale = 1.0)
@@ -2918,37 +2952,65 @@ function Get-PetFrames {
 
     $hbs = New-Object System.Collections.ArrayList
     $w = 0; $h = 0
+
+    # 素材是 24fps;想要更高刷新率就插中间帧(线性混合),播放时长不变
+    $targetFps = [int](Get-PetSetting -Name 'petFps' -Default 60)
+    if ($targetFps -lt 12) { $targetFps = 12 }
+    $k = 1
+    if ($targetFps -gt [int]($fps * 1.2)) { $k = 2 }
+    # 内存闸门:一个动作最多 300 帧(约 80MB),再高就不插了
+    if (($files.Count * $k) -gt 300) {
+        Write-Log ('帧插值跳过:' + $Anim + ' 帧数偏多(' + $files.Count + ' × ' + $k + ')') 'WARN'
+        $k = 1
+    }
+
+    $prev = $null
     foreach ($f in $files) {
+        $bmp = $null
         try {
             $bytes = [System.IO.File]::ReadAllBytes($f.FullName)
             $ms = New-Object System.IO.MemoryStream -ArgumentList (,$bytes)
             $img = [System.Drawing.Image]::FromStream($ms)
-            $bmp = New-Object System.Drawing.Bitmap -ArgumentList $img
+            $raw = New-Object System.Drawing.Bitmap -ArgumentList $img
             $img.Dispose(); $ms.Dispose()
 
             if ([Math]::Abs($Scale - 1.0) -lt 0.01) {
-                if ($w -eq 0) { $w = $bmp.Width; $h = $bmp.Height }
-                [void]$hbs.Add([CampusNetPet.Layered]::ToHBitmap($bmp))
+                $bmp = $raw
             } else {
-                $dw = [Math]::Max(1, [int][Math]::Round($bmp.Width * $Scale))
-                $dh = [Math]::Max(1, [int][Math]::Round($bmp.Height * $Scale))
+                $dw = [Math]::Max(1, [int][Math]::Round($raw.Width * $Scale))
+                $dh = [Math]::Max(1, [int][Math]::Round($raw.Height * $Scale))
                 $scaled = New-Object System.Drawing.Bitmap -ArgumentList $dw, $dh, ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
                 $g = [System.Drawing.Graphics]::FromImage($scaled)
                 $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
                 $g.CompositingMode = [System.Drawing.Drawing2D.CompositingMode]::SourceCopy
                 $g.Clear([System.Drawing.Color]::Transparent)
-                $g.DrawImage($bmp, 0, 0, $dw, $dh)
+                $g.DrawImage($raw, 0, 0, $dw, $dh)
                 $g.Dispose()
-                if ($w -eq 0) { $w = $dw; $h = $dh }
-                [void]$hbs.Add([CampusNetPet.Layered]::ToHBitmap($scaled))
-                $scaled.Dispose()
+                $raw.Dispose()
+                $bmp = $scaled
             }
-            $bmp.Dispose()
-        } catch { }
+            if ($w -eq 0) { $w = $bmp.Width; $h = $bmp.Height }
+
+            # 上一帧和这一帧之间插一张(顺序:帧0 → 混合 → 帧1 → …)
+            if ($k -gt 1 -and $prev -and $prev.Width -eq $bmp.Width -and $prev.Height -eq $bmp.Height) {
+                $mid = Merge-PetBitmap -A $prev -B $bmp -Alpha 0.5
+                if ($mid) {
+                    [void]$hbs.Add([CampusNetPet.Layered]::ToHBitmap($mid))
+                    $mid.Dispose()
+                }
+            }
+            [void]$hbs.Add([CampusNetPet.Layered]::ToHBitmap($bmp))
+
+            if ($prev) { $prev.Dispose() }
+            $prev = $bmp
+        } catch {
+            if ($bmp) { try { $bmp.Dispose() } catch { } }
+        }
     }
+    if ($prev) { try { $prev.Dispose() } catch { } }
     if ($hbs.Count -eq 0) { return $null }
 
-    $entry = [pscustomobject]@{ Hbs = $hbs; W = $w; H = $h; Count = $hbs.Count; Fps = $fps }
+    $entry = [pscustomobject]@{ Hbs = $hbs; W = $w; H = $h; Count = $hbs.Count; Fps = ($fps * $k) }
     $script:PetCache[$key] = $entry
     if ($script:PetCache.Count -gt 3) {
         foreach ($k in @($script:PetCache.Keys)) {
@@ -4069,14 +4131,14 @@ function Update-Pet {
 
     # 随机走动
     if (-not $script:PetTarget -and -not $script:PetAction) {
-        $wanderOn = [bool](Get-PetSetting -Name 'petWander' -Default $true)
+        $wanderOn = [bool]$cfg.Wander
         if ($wanderOn -and $script:PetStillSince -ne [datetime]::MinValue -and ($now - $script:PetStillSince).TotalSeconds -ge 45) {
             Start-PetWander
         }
     }
 
     # 随机动作 / 表情包
-    $randMin = [int](Get-PetSetting -Name 'petRandomMin' -Default 5)
+    $randMin = [int]$cfg.RandomMin
     if ($randMin -gt 0 -and $now -gt $script:PetNextRandom -and -not $script:PetAction -and -not $script:PetTarget) {
         $script:PetNextRandom = $now.AddMinutes($randMin)
         $pool = @(Get-PetAnimList | Where-Object { $_.id -ne 'idle' -and $_.id -ne 'sleep' -and $_.id -ne 'walk' })
@@ -4288,6 +4350,35 @@ function New-PetMenu {
     [void]$miBox.DropDownItems.Add($miBoxSize)
     [void]$menu.Items.Add($miBox)
 
+    # 帧率(24 = 素材原生;48/60 = 插中间帧,动作时长不变)
+    $miFps = New-Object System.Windows.Forms.ToolStripMenuItem
+    $miFps.Text = '帧率'
+    $curFps = [int](Get-PetSetting -Name 'petFps' -Default 60)
+    foreach ($opt in @(
+            @{ v = 24; t = '24Hz(原生,最省内存)' },
+            @{ v = 48; t = '48Hz(插一帧)' },
+            @{ v = 60; t = '60Hz(插一帧 + 60Hz 计时器)' }
+        )) {
+        $mi = New-Object System.Windows.Forms.ToolStripMenuItem
+        $mi.Text = [string]$opt.t
+        $mi.Checked = ($curFps -eq [int]$opt.v)
+        $mi.Tag = [int]$opt.v
+        $mi.add_Click({
+                param($sender, $e)
+                $v = [int]$sender.Tag
+                Set-PetSettingValue -Name 'petFps' -Value $v
+                # 帧缓存是按旧帧率插值的,得清掉重来
+                foreach ($k in @($script:PetCache.Keys)) {
+                    foreach ($hb in $script:PetCache[$k].Hbs) { [CampusNetPet.Layered]::FreeHBitmap($hb) }
+                }
+                $script:PetCache = @{}
+                $script:PetLastIdx = -1
+                if ($script:PetTimer) { $script:PetTimer.Interval = 4 }
+                Write-Log ('宠物帧率: ' + $v + 'Hz')
+            })
+        [void]$miFps.DropDownItems.Add($mi)
+    }
+    [void]$menu.Items.Add($miFps)
     # 物理(拖拽抛掷手感)
     $miPhys = New-Object System.Windows.Forms.ToolStripMenuItem
     $miPhys.Text = '物理'
@@ -4475,8 +4566,23 @@ function Start-Pet {
     $form.Text = '校园网宠物'
     $form.ClientSize = New-Object System.Drawing.Size -ArgumentList $w, $h
     $form.Location = New-Object System.Drawing.Point -ArgumentList $script:PetX, $script:PetY
-    $form.ContextMenuStrip = New-PetMenu
-
+    $script:PetMenu = New-PetMenu
+    $form.ContextMenuStrip = $script:PetMenu
+    # 点菜单外面自动关闭(窗口 TopMost 且没有焦点时,默认行为常常不收起)
+    $script:PetMenuGuard = New-Object System.Windows.Forms.Timer
+    $script:PetMenuGuard.Interval = 40
+    $script:PetMenuGuard.add_Tick({
+            if (-not $script:PetMenu -or -not $script:PetMenu.Visible) { $script:PetMenuGuard.Stop(); return }
+            $btn = [System.Windows.Forms.Control]::MouseButtons
+            if ($btn -eq [System.Windows.Forms.MouseButtons]::None) { return }
+            $cp = [System.Windows.Forms.Cursor]::Position
+            if (-not $script:PetMenu.Bounds.Contains($cp)) {
+                $script:PetMenu.Close()
+                $script:PetMenuGuard.Stop()
+            }
+        })
+    $script:PetMenu.add_Opened({ $script:PetMenuGuard.Start() })
+    $script:PetMenu.add_Closed({ $script:PetMenuGuard.Stop() })
     $form.add_MouseEnter({
             $script:PetHover = $true
             $script:PetHoverOffAt = [datetime]::MinValue
@@ -4526,8 +4632,13 @@ function Start-Pet {
                     if ($speed -gt 120) { Start-PetPhysics -Vx $script:PetDrag.VX -Vy $script:PetDrag.VY }
                 }
                 else {
-                    Play-PetAction -Id 'wave'
-                    Write-Log '宠物被点了一下(挥手)'
+                    # 点一下 / 摸头:随机挑一个动作(上半部分算摸头)
+                    $head = ($e.Y -lt ($s.ClientSize.Height * 0.4))
+                    $pool = @(Get-PetAnimList | Where-Object { $_.id -notin @('idle', 'sleep', 'walk') })
+                    $pick = 'wave'
+                    if ($pool.Count -gt 0) { $pick = [string]$pool[(Get-Random -Maximum $pool.Count)].id }
+                    Play-PetAction -Id $pick
+                    Write-Log ('宠物被' + $(if ($head) { '摸头' } else { '点了一下' }) + ' → ' + (Get-PetLabel $pick))
                     if ([bool](Get-PetCfg).Say -and (Get-Random -Maximum 100) -lt 30) { Show-PetSaying }
                 }
                 $script:PetDrag = $null
@@ -4566,6 +4677,9 @@ function Start-Pet {
     New-PetOverlayWindow
 
     $timer = New-Object System.Windows.Forms.Timer
+    $fpsWant = [int](Get-PetSetting -Name 'petFps' -Default 60)
+    if ($fpsWant -lt 12) { $fpsWant = 24 }
+    # WinForms 的 Timer 分辨率约 15.6ms,用 4ms 间隔让它跑满;实际节拍由每帧工作量决定
     $timer.Interval = 4
     $timer.add_Tick({ try { Update-Pet } catch { } })
     $timer.Start()
@@ -4576,7 +4690,7 @@ function Start-Pet {
     if (-not $Quiet) {
         $anims = @(Get-PetAnimList | Where-Object { $_.id -notin @('idle', 'sleep', 'walk') }).Count
         $memes = @(Get-PetMemeList).Count
-        Write-Log ('桌面宠物已启动(' + $w + 'x' + $h + ',' + (Get-PetFps) + 'fps,' + $anims + ' 个动作,' + $memes + ' 张表情包,素材:' + $script:PetUrl + ')') 'OK'
+        Write-Log ('桌面宠物已启动(' + $w + 'x' + $h + ',' + $fpsWant + 'Hz(素材 ' + (Get-PetFps) + 'fps),' + $anims + ' 个动作,' + $memes + ' 张表情包,素材:' + $script:PetUrl + ')') 'OK'
     }
     return $true
 }
