@@ -1,6 +1,6 @@
 # 校园网自动登录(托盘 + 开机自启 + 多账号 + WiFi + 校时 + 网速 + 一键诊断 + 通知中心 + 唤醒重认证 + 自动修复 + 桌宠)
 
-![version](https://img.shields.io/badge/version-1.1.7-blue)
+![version](https://img.shields.io/badge/version-1.1.8-blue)
 
 **校园网自动认证登录 / WiFi 自动认证登录** —— Windows 装一次,之后开机自动连校园无线网、自动完成 Portal 认证、掉线自动重连。宿舍 WiFi(ChinaNet / CMCC-EDU / 沃 WiFi)、教学楼认证页都适用。
 
@@ -732,6 +732,15 @@ rememberPwd=0
 真要在登录前联网,需要改成 SYSTEM 运行 + `-MachineScope` 机器级加密 —— 需要就说一声。
 
 ## 更新日志
+
+### v1.1.8(2026-10-18)
+
+- **修:切帧率没反应**。原来只靠菜单回调清缓存,回调没跑到(或缓存没清干净)就一直是旧帧率。现在 `Update-Pet` 每帧比对 `petFps` 和已应用值,不一致就**自己重建帧缓存**(菜单、手改 `settings.json` 都生效),日志会打 `宠物帧率:48Hz(已重建帧缓存)`
+- **修:关掉窗口后没有托盘/桌宠**
+  - 菜单退出时:装了开机自启就**自动把托盘拉回来**(`Start-TrayIfNeeded`);没装则明确提示「选 9) 安装开机自启 才会常驻」
+  - 托盘加了 UI 异常兜底(`Application.ThreadException`):回调抛异常只记日志,不再让整个托盘退出
+- 帧缓存重建后补一次 `GC.Collect()`(连切两档会涨几十 MB)
+- 说明:托盘里同时在做网速/状态刷新,**实测计时器 52 Hz、渲染 37 fps**;想要满 60 用 `-Mode pet` 单独跑(59.6 Hz / 47 fps)
 
 ### v1.1.7(2026-10-18)
 

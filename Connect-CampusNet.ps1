@@ -103,7 +103,7 @@ $VbsFile    = Join-Path $WorkDir 'run-hidden.vbs'
 $TaskName   = 'CampusNet-AutoLogin'
 $RepairTaskName = 'CampusNet-Repair'
 $UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-$script:AppVersion = '1.1.7'
+$script:AppVersion = '1.1.8'
 $Curl = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
 $script:NicList = $null
 $script:NicListAt = [datetime]::MinValue
@@ -2954,7 +2954,7 @@ function Get-PetFrames {
     $w = 0; $h = 0
 
     # 素材是 24fps;想要更高刷新率就插中间帧(线性混合),播放时长不变
-    $targetFps = [int](Get-PetSetting -Name 'petFps' -Default 60)
+    $targetFps = [int](Get-PetCfg).Fps
     if ($targetFps -lt 12) { $targetFps = 12 }
     $k = 1
     if ($targetFps -gt [int]($fps * 1.2)) { $k = 2 }
@@ -3061,6 +3061,7 @@ function Get-PetCfg {
         OverlayFont    = $(if ($s -and $s.PSObject.Properties['petOverlayFont'] -and [double]$s.petOverlayFont -gt 0) { [double]$s.petOverlayFont } else { 9.5 })
         OverlayOpacity = $(if ($s -and $s.PSObject.Properties['petOverlayOpacity'] -and [double]$s.petOverlayOpacity -gt 0) { [double]$s.petOverlayOpacity } else { 0.94 })
         OverlayW       = $(if ($s -and $s.PSObject.Properties['petOverlayW'] -and [int]$s.petOverlayW -gt 0) { [int]$s.petOverlayW } else { 0 })
+        Fps            = $(if ($s -and $s.PSObject.Properties['petFps'] -and [int]$s.petFps -ge 12) { [int]$s.petFps } else { 60 })
         OverlayH       = $(if ($s -and $s.PSObject.Properties['petOverlayH'] -and [int]$s.petOverlayH -gt 0) { [int]$s.petOverlayH } else { 0 })
         Gravity        = $(if ($s -and $s.PSObject.Properties['petGravity'] -and [int]$s.petGravity -gt 0) { [double]$s.petGravity } else { 1400 })
         Restitution    = $(if ($s -and $s.PSObject.Properties['petRestitution']) { [double]$s.petRestitution } else { 0.78 })
@@ -4077,6 +4078,19 @@ function Update-Pet {
         $script:PetSw.Restart()
     }
 
+    # 帧率变了(菜单切换 / 手改 settings.json)就重建帧缓存;不依赖菜单回调,自己会纠正
+    if ([int]$cfg.Fps -ne $script:PetFpsApplied) {
+        $script:PetFpsApplied = [int]$cfg.Fps
+        foreach ($k in @($script:PetCache.Keys)) {
+            foreach ($hb in $script:PetCache[$k].Hbs) { [CampusNetPet.Layered]::FreeHBitmap($hb) }
+        }
+        $script:PetCache = @{}
+        $script:PetLastIdx = -1
+        # 位图刚释放,催一下 GC,免得托管包装攒着(重建两次能涨几十 MB)
+        [GC]::Collect()
+        Write-Log ('宠物帧率:' + $script:PetFpsApplied + 'Hz(已重建帧缓存)')
+    }
+
     $entry = Get-PetFrames -Anim $anim -Scale $cfg.Scale
     if (-not $entry) { return }
     $fps = $entry.Fps
@@ -4770,6 +4784,23 @@ function Start-WatcherIfNeeded {
         -ArgumentList ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -Mode watch -Background' -f $SelfScript)
     Write-Log '已拉起后台守护进程'
 }
+function Start-TrayIfNeeded {
+    # 菜单关掉之后把托盘拉回来:不然用户会觉得"窗口一关图标就没了"
+    if (Get-TrayProcess) { return $false }
+    try {
+        if (Test-Path $VbsFile) {
+            Start-Process -FilePath 'wscript.exe' -ArgumentList ('//nologo "{0}"' -f $VbsFile) -WindowStyle Hidden
+        } else {
+            Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden `
+                -ArgumentList ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -Mode tray -Background' -f $SelfScript)
+        }
+        Write-Log '已拉起托盘进程'
+        return $true
+    } catch {
+        Write-Log ('拉起托盘失败:' + $_.Exception.Message) 'WARN'
+        return $false
+    }
+}
 
 function Get-TrayProcess {
     foreach ($p in (Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue)) {
@@ -4901,6 +4932,15 @@ function Invoke-Tray {
 
     # 先声明 DPI 感知(必须在建窗口之前),否则宠物窗口在高缩放下会被放大并偏移
     [void](Set-PetDpiAware)
+
+    # 托盘里的 UI 回调出异常时只记日志,不要直接退出(否则用户看到的是"图标自己没了")
+    try {
+        [System.Windows.Forms.Application]::SetUnhandledExceptionMode([System.Windows.Forms.UnhandledExceptionMode]::CatchException)
+        [System.Windows.Forms.Application]::add_ThreadException({
+                param($sender, $e)
+                try { Write-Log ('托盘异常(已忽略,继续运行):' + $e.Exception.Message) 'WARN' } catch { }
+            })
+    } catch { }
 
     # 托盘一起来就把通知身份备好:之后的通知都进通知中心(而不是被吞掉的气泡)
     [void](Register-AppIdentity)
@@ -6489,5 +6529,13 @@ switch ($Mode) {
             Invoke-Wizard
         }
         Show-Menu
+        # 菜单关掉之后:装了自启就把托盘拉回来;没装就明确告诉用户为啥没有常驻图标
+        if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+            [void](Start-TrayIfNeeded)
+        } else {
+            Write-Stdout ''
+            Write-Stdout '提示: 还没装「开机自启」,所以关掉这个窗口后不会有托盘图标和桌宠常驻。'
+            Write-Stdout '      菜单里选 9) 安装开机自启 就会一直留在右下角。'
+        }
     }
 }
