@@ -103,7 +103,7 @@ $VbsFile    = Join-Path $WorkDir 'run-hidden.vbs'
 $TaskName   = 'CampusNet-AutoLogin'
 $RepairTaskName = 'CampusNet-Repair'
 $UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-$script:AppVersion = '1.2.0'
+$script:AppVersion = '1.2.1'
 $Curl = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
 $script:NicList = $null
 $script:NicListAt = [datetime]::MinValue
@@ -2713,6 +2713,9 @@ $script:PetAnim   = ''
 $script:PetLastIdx = -1
 $script:PetAction = ''
 $script:PetActionEnd = [datetime]::MinValue
+$script:PetActionStart = [datetime]::MinValue
+$script:PetActionPingPong = $true
+$script:PetActionDurSec = 0.0
 $script:PetX      = 0
 $script:PetY      = 0
 $script:PetXf     = 0.0
@@ -3912,9 +3915,32 @@ function Hide-PetOverlay {
     $script:PetOverlayContent = $null
 }
 # ---------------- 动作 / 走动 ----------------
+function Get-PetAnimMeta {
+    param([string]$Id)
+    foreach ($a in (Get-PetAnimList)) { if ([string]$a.id -eq $Id) { return $a } }
+    return $null
+}
+
+function Get-PetActionMs {
+    # 原项目每段动作都是 10 秒(assets/preview 里的 GIF 全是 120 帧 × 83ms = 10.00 秒),
+    # 而我们抠帧时只截了其中 1.4 秒一段 —— 所以要按 pet.json 里的 ms 循环播放撑满,
+    # 而不是播一遍就回待机。想改时长就改 pet.json 的 ms。
+    param([string]$Id)
+    $m = Get-PetAnimMeta -Id $Id
+    if ($m -and $m.PSObject.Properties['ms'] -and [int]$m.ms -gt 0) { return [int]$m.ms }
+    return 0
+}
+
 function Get-PetCurrentAnim {
     if ($script:PetAction -and (Get-Date) -lt $script:PetActionEnd) { return $script:PetAction }
-    if ($script:PetAction) { $script:PetAction = '' }
+    if ($script:PetAction) {
+        try {
+            $spent = ((Get-Date) - $script:PetActionStart).TotalSeconds
+            Write-Log ('宠物动作结束:' + (Get-PetLabel $script:PetAction) + ' 实际 ' + [Math]::Round($spent, 1) + ' 秒')
+        } catch { }
+        $script:PetAction = ''
+        $script:PetActionStart = [datetime]::MinValue
+    }
     if ($script:PetTarget) { return 'walk' }
     if (Test-PetShouldSleep) { return 'sleep' }
     return 'idle'
@@ -3927,14 +3953,25 @@ function Play-PetAction {
     $entry = Get-PetFrames -Anim $Id -Scale (Get-PetCfg).Scale
     if (-not $entry) { return }
     $fps = $entry.Fps
+    $meta = Get-PetAnimMeta -Id $Id
+    $ms = Get-PetActionMs -Id $Id
+    $dur = 0.0
+    if ($HoldSec -gt 0) { $dur = [double]$HoldSec }
+    elseif ($ms -gt 0) { $dur = $ms / 1000.0 }
+    else { $dur = ($entry.Count / $fps) }
+    # 素材只有一段,来回播(0→末→0)接缝最自然;pet.json 里写 "pingpong": false 可以关掉
+    $pingpong = $true
+    if ($meta -and $meta.PSObject.Properties['pingpong']) { $pingpong = [bool]$meta.pingpong }
     $script:PetAction = $Id
-    $dur = $(if ($HoldSec -gt 0) { $HoldSec } else { ($entry.Count / $fps) })
+    $script:PetActionStart = Get-Date
+    $script:PetActionPingPong = $pingpong
+    $script:PetActionDurSec = $dur
     $script:PetActionEnd = (Get-Date).AddSeconds($dur + 0.15)
     $script:PetAnim = $Id
     $script:PetLastIdx = -1
     if ($script:PetSw) { $script:PetSw.Restart() }
     $script:PetStillSince = (Get-Date).AddSeconds($dur)
-    Write-Log ('宠物动作:' + (Get-PetLabel $Id))
+    Write-Log ('宠物动作:' + (Get-PetLabel $Id) + ' ' + [Math]::Round($dur, 1) + ' 秒' + $(if ($pingpong) { '(往返循环)' } else { '(循环)' }))
 }
 
 function Start-PetWander {
@@ -4109,7 +4146,18 @@ function Update-Pet {
     $fps = $entry.Fps
     $idx = [int]([Math]::Floor($script:PetSw.Elapsed.TotalSeconds * $fps))
     if ($script:PetAction) {
-        if ($idx -ge $entry.Count) { $idx = $entry.Count - 1 }
+        # 动作要循环撑满整段时长:往返播(0→末→0),接缝处不会硬跳
+        $total = [int]$entry.Count
+        if ($total -le 1) {
+            $idx = 0
+        } elseif ($script:PetActionPingPong) {
+            $cycle = ($total * 2) - 2
+            $i2 = $idx % $cycle
+            if ($i2 -ge $total) { $i2 = $cycle - $i2 }
+            $idx = [Math]::Min($i2, $total - 1)
+        } else {
+            $idx = $idx % $total
+        }
     } else {
         $idx = $idx % $entry.Count
     }

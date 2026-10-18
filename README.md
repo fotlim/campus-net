@@ -1,6 +1,6 @@
 # 校园网自动登录(托盘 + 开机自启 + 多账号 + WiFi + 校时 + 网速 + 一键诊断 + 通知中心 + 唤醒重认证 + 自动修复 + 桌宠)
 
-![version](https://img.shields.io/badge/version-1.2.0-blue)
+![version](https://img.shields.io/badge/version-1.2.1-blue)
 
 **校园网自动认证登录 / WiFi 自动认证登录** —— Windows 装一次,之后开机自动连校园无线网、自动完成 Portal 认证、掉线自动重连。宿舍 WiFi(ChinaNet / CMCC-EDU / 沃 WiFi)、教学楼认证页都适用。
 
@@ -735,6 +735,10 @@ rememberPwd=0
 真要在登录前联网,需要改成 SYSTEM 运行 + `-MachineScope` 机器级加密 —— 需要就说一声。
 
 ## 更新日志
+
+### v1.2.1(2026-10-18)
+
+- **动作时长对齐原项目**:dsh-pet 每段动作都是 10 秒(assets/preview/*.gif 全是 120 帧 × 83ms = 10.00 秒),之前只播 1.4 秒就回待机。现在按 `pet.json` 的 `ms` **循环播放 10 秒**(往返播,接缝不硬跳):日志会写 `宠物动作:撸猫 10 秒(往返循环)` 和 `宠物动作结束:撸猫 实际 10.2 秒`。想改时长直接改 `pet.json` 的 `ms`,`"pingpong": false` 可改成普通循环
 
 ### v1.2.0(2026-10-18)
 
