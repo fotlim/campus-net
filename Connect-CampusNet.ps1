@@ -103,7 +103,7 @@ $VbsFile    = Join-Path $WorkDir 'run-hidden.vbs'
 $TaskName   = 'CampusNet-AutoLogin'
 $RepairTaskName = 'CampusNet-Repair'
 $UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-$script:AppVersion = '1.2.9'
+$script:AppVersion = '1.3.0'
 $Curl = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
 $script:NicList = $null
 $script:NicListAt = [datetime]::MinValue
@@ -3229,7 +3229,7 @@ function Get-PetFrames {
 
     if ($Scale -lt 0.5) { $Scale = 0.5 }
     if ($Scale -gt 2.0) { $Scale = 2.0 }
-    $key = ('{0}@{1:N2}@{2}@{3}' -f $Anim, $Scale, $script:PetModelId, $script:PetVariantId)
+    $key = ('{0}@{1:N2}@{2}@{3}' -f $Anim, $Scale, $script:ModelId, $script:VariantId)
     if ($script:PetCache.ContainsKey($key)) { return $script:PetCache[$key] }
     if ($script:PetBuilding -eq $key) { return $null }   # 建帧时会跑 DoEvents,消息循环可能转回来要同一套帧
 
@@ -3261,102 +3261,98 @@ function Get-PetFrames {
         if ($canvasW -lt 1) { $canvasW = 0 }
     }
 
-    $hbs = New-Object System.Collections.ArrayList
-    $w = 0; $h = 0
-
-    # 素材是 24fps;想要更高刷新率就插中间帧(线性混合),播放时长不变
-    $targetFps = [int](Get-PetCfg).Fps
-    if ($targetFps -lt 12) { $targetFps = 12 }
-    $k = 1
-    # 长动作(整段 10 秒、上百帧)也插帧,否则 12fps 素材看着一顿一顿的;
-    # 但 idle/sleep/walk 是慢速循环,不插(省内存)
-    $interpOk = (($fps -lt 20) -and (($files.Count -le 90) -or ($Anim -notin @('idle', 'sleep', 'walk'))))
-    if ($targetFps -gt [int]($fps * 1.2) -and $interpOk) { $k = 2 }
-    # 内存闸门:一个动作最多 300 帧(约 80MB),再高就不插了
-    if (($files.Count * $k) -gt 300) {
-        Write-Log ('帧插值跳过:' + $Anim + ' 帧数偏多(' + $files.Count + ' × ' + $k + ')') 'WARN'
-        $k = 1
-    }
-
-    $prev = $null
-    $script:PetBuilding = $key
-    $built = 0
-    try {
-    foreach ($f in $files) {
-        $bmp = $null
+    # 帧**按需解码**:不再一次性把 241 帧全解成位图(那样点一下要卡一秒,还占几百 MB)。
+    # entry.Hbs 是个字典,播放到哪一帧就解哪一帧,前后各留一小段。
+    $hbs = @{}
+    $w = $canvasW; $h = $canvasH
+    if ($w -lt 1 -or $h -lt 1) {
+        # 老素材没有 canvas 字段:拿第一帧的尺寸当画布
         try {
-            $bytes = [System.IO.File]::ReadAllBytes($f.FullName)
-            $ms = New-Object System.IO.MemoryStream -ArgumentList (,$bytes)
-            $img = [System.Drawing.Image]::FromStream($ms)
-            $raw = New-Object System.Drawing.Bitmap -ArgumentList $img
-            $img.Dispose(); $ms.Dispose()
-
-            if ([Math]::Abs($Scale - 1.0) -lt 0.01) {
-                $bmp = $raw
-            } else {
-                $dw = [Math]::Max(1, [int][Math]::Round($raw.Width * $Scale))
-                $dh = [Math]::Max(1, [int][Math]::Round($raw.Height * $Scale))
-                $scaled = New-Object System.Drawing.Bitmap -ArgumentList $dw, $dh, ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
-                $g = [System.Drawing.Graphics]::FromImage($scaled)
-                $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-                $g.CompositingMode = [System.Drawing.Drawing2D.CompositingMode]::SourceCopy
-                $g.Clear([System.Drawing.Color]::Transparent)
-                $g.DrawImage($raw, 0, 0, $dw, $dh)
-                $g.Dispose()
-                $raw.Dispose()
-                $bmp = $scaled
-            }
-            # 配色变体:把颜色矩阵烘进帧,播放时零开销
-            if ($script:PetTint) { $bmp = Apply-PetTint -Bitmap $bmp -Matrix $script:PetTint }
-            # 垫进统一画布(不缩放,只改位置):切换动作时窗口尺寸和角色位置都不变
-            if ($canvasW -gt 0 -and ($bmp.Width -ne $canvasW -or $bmp.Height -ne $canvasH)) {
-                $pad = New-Object System.Drawing.Bitmap -ArgumentList $canvasW, $canvasH, ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
-                $gp = [System.Drawing.Graphics]::FromImage($pad)
-                $gp.CompositingMode = [System.Drawing.Drawing2D.CompositingMode]::SourceCopy
-                $gp.Clear([System.Drawing.Color]::Transparent)
-                $gp.DrawImage($bmp, $oxS, $oyS, $bmp.Width, $bmp.Height)
-                $gp.Dispose()
-                $bmp.Dispose()
-                $bmp = $pad
-            }
-            if ($w -eq 0) { $w = $bmp.Width; $h = $bmp.Height }
-
-            # 上一帧和这一帧之间插一张(顺序:帧0 → 混合 → 帧1 → …)
-            if ($k -gt 1 -and $prev -and $prev.Width -eq $bmp.Width -and $prev.Height -eq $bmp.Height) {
-                $mid = Merge-PetBitmap -A $prev -B $bmp -Alpha 0.5
-                if ($mid) {
-                    [void]$hbs.Add([CampusNetPet.Layered]::ToHBitmap($mid))
-                    $mid.Dispose()
-                }
-            }
-            [void]$hbs.Add([CampusNetPet.Layered]::ToHBitmap($bmp))
-
-            if ($prev) { $prev.Dispose() }
-            $prev = $bmp
-            $built++
-            if (($built % 8) -eq 0) { try { [System.Windows.Forms.Application]::DoEvents() } catch { } }
-        } catch {
-            if ($bmp) { try { $bmp.Dispose() } catch { } }
-        }
+            $bytes0 = [System.IO.File]::ReadAllBytes($files[0].FullName)
+            $ms0 = New-Object System.IO.MemoryStream -ArgumentList (,$bytes0)
+            $img0 = [System.Drawing.Image]::FromStream($ms0)
+            $w = [Math]::Max(1, [int][Math]::Round($img0.Width * $Scale))
+            $h = [Math]::Max(1, [int][Math]::Round($img0.Height * $Scale))
+            $img0.Dispose(); $ms0.Dispose()
+        } catch { $w = 200; $h = 200 }
     }
-    if ($prev) { try { $prev.Dispose() } catch { } }
-    } finally { $script:PetBuilding = $null }
-    if ($hbs.Count -eq 0) { return $null }
 
-    $entry = [pscustomobject]@{ Hbs = $hbs; W = $w; H = $h; Count = $hbs.Count; Fps = ($fps * $k) }
+    $entry = [pscustomobject]@{
+        Hbs = $hbs; W = $w; H = $h; Count = $files.Count; Fps = $fps
+        Files = $files; Ox = $oxS; Oy = $oyS; CanvasW = $canvasW; CanvasH = $canvasH
+        Anim = $Anim; Scale = $Scale; Tint = $script:PetTint
+    }
     $script:PetCache[$key] = $entry
-    # 24fps 整段动作一帧要 250KB 上下,缓存只留「当前动作 + idle」两个,免得吃几百 MB
+    # 只留「当前动作 + idle」两个 meta;解码出来的帧按距离淘汰
     if ($script:PetCache.Count -gt 2) {
-        foreach ($k in @($script:PetCache.Keys)) {
-            if ($k -eq $key -or $k -like 'idle@*') { continue }
-            foreach ($hb in $script:PetCache[$k].Hbs) { [CampusNetPet.Layered]::FreeHBitmap($hb) }
-            $script:PetCache.Remove($k)
+        foreach ($k2 in @($script:PetCache.Keys)) {
+            if ($k2 -eq $key -or $k2 -like 'idle@*') { continue }
+            foreach ($hb in @($script:PetCache[$k2].Hbs.Values)) { [CampusNetPet.Layered]::FreeHBitmap($hb) }
+            $script:PetCache.Remove($k2)
         }
-        $script:PetLastHb = [IntPtr]::Zero
-$script:PetLastAnim = ''
-$script:PetLastFrameIdx = 0
     }
     return $entry
+}
+
+function Get-PetFrameHb {
+    # 取某一帧的 HBITMAP:没解过就现在解(解码+缩放+配色+垫画布),并淘汰离当前位置太远的帧
+    param($Entry, [int]$Index)
+    if (-not $Entry -or $Entry.Count -le 0) { return [IntPtr]::Zero }
+    if ($Index -lt 0) { $Index = 0 }
+    if ($Index -ge $Entry.Count) { $Index = $Entry.Count - 1 }
+    $bag = $Entry.Hbs
+    if ($bag.ContainsKey($Index)) { return $bag[$Index] }
+    $file = $null
+    if ($Entry.Files -and $Entry.Files.Count -gt $Index) { $file = $Entry.Files[$Index] } else { return [IntPtr]::Zero }
+    $bmp = $null
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
+        $ms = New-Object System.IO.MemoryStream -ArgumentList (,$bytes)
+        $img = [System.Drawing.Image]::FromStream($ms)
+        $raw = New-Object System.Drawing.Bitmap -ArgumentList $img
+        $img.Dispose(); $ms.Dispose()
+        $scale = [double]$Entry.Scale
+        if ([Math]::Abs($scale - 1.0) -lt 0.01) {
+            $bmp = $raw
+        } else {
+            $dw = [Math]::Max(1, [int][Math]::Round($raw.Width * $scale))
+            $dh = [Math]::Max(1, [int][Math]::Round($raw.Height * $scale))
+            $scaled = New-Object System.Drawing.Bitmap -ArgumentList $dw, $dh, ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+            $g = [System.Drawing.Graphics]::FromImage($scaled)
+            $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+            $g.CompositingMode = [System.Drawing.Drawing2D.CompositingMode]::SourceCopy
+            $g.Clear([System.Drawing.Color]::Transparent)
+            $g.DrawImage($raw, 0, 0, $dw, $dh)
+            $g.Dispose(); $raw.Dispose()
+            $bmp = $scaled
+        }
+        if ($Entry.Tint) { $bmp = Apply-PetTint -Bitmap $bmp -Matrix $Entry.Tint }
+        if ([int]$Entry.CanvasW -gt 0 -and ($bmp.Width -ne $Entry.W -or $bmp.Height -ne $Entry.H)) {
+            $pad = New-Object System.Drawing.Bitmap -ArgumentList $Entry.W, $Entry.H, ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+            $gp = [System.Drawing.Graphics]::FromImage($pad)
+            $gp.CompositingMode = [System.Drawing.Drawing2D.CompositingMode]::SourceCopy
+            $gp.Clear([System.Drawing.Color]::Transparent)
+            $gp.DrawImage($bmp, [int]$Entry.Ox, [int]$Entry.Oy, $bmp.Width, $bmp.Height)
+            $gp.Dispose(); $bmp.Dispose()
+            $bmp = $pad
+        }
+        $hb = [CampusNetPet.Layered]::ToHBitmap($bmp)
+        $bmp.Dispose()
+        $bag[$Index] = $hb
+        # 只保留当前位置前后各 10 帧,内存 ≈ 20 × 250KB ≈ 5MB
+        if ($bag.Count -gt 22) {
+            foreach ($k2 in @($bag.Keys)) {
+                if ([Math]::Abs([int]$k2 - $Index) -gt 10) {
+                    try { [CampusNetPet.Layered]::FreeHBitmap($bag[$k2]) } catch { }
+                    $bag.Remove($k2)
+                }
+            }
+        }
+        return $hb
+    } catch {
+        if ($bmp) { try { $bmp.Dispose() } catch { } }
+        return [IntPtr]::Zero
+    }
 }
 
 function Test-PetShouldSleep {
@@ -4465,7 +4461,7 @@ function Update-Pet {
     if ([int]$cfg.Fps -ne $script:PetFpsApplied) {
         $script:PetFpsApplied = [int]$cfg.Fps
         foreach ($k in @($script:PetCache.Keys)) {
-            foreach ($hb in $script:PetCache[$k].Hbs) { [CampusNetPet.Layered]::FreeHBitmap($hb) }
+            foreach ($hb in @($script:PetCache[$k].Hbs.Values)) { [CampusNetPet.Layered]::FreeHBitmap($hb) }
         }
         $script:PetLastHb = [IntPtr]::Zero
 $script:PetLastAnim = ''
@@ -4503,12 +4499,16 @@ $script:PetLastFrameIdx = 0
     $moved = ($px -ne $script:PetLastDrawX -or $py -ne $script:PetLastDrawY)
 
     # 位置变化也要重画:否则移动只能按动画帧率跳,看着就是"卡顿"
-    if ($idx -ne $script:PetLastIdx -or $moved) {
+    # 弹跳/拖动这种高速移动时每帧都重画,别让位置更新跳过绘制
+    if ($idx -ne $script:PetLastIdx -or $moved -or $script:PetPhys -or $script:PetDrag) {
         $script:PetLastIdx = $idx
         if ($script:PetForm.ClientSize.Width -ne $entry.W -or $script:PetForm.ClientSize.Height -ne $entry.H) {
             $script:PetForm.ClientSize = New-Object System.Drawing.Size -ArgumentList $entry.W, $entry.H
         }
-        $null = [CampusNetPet.Layered]::Draw($script:PetForm.Handle, $entry.Hbs[$idx], $entry.W, $entry.H, $px, $py, [byte]255)
+        $hbNow = Get-PetFrameHb -Entry $entry -Index $idx
+        if ($hbNow -eq [IntPtr]::Zero) { return }
+        $null = [CampusNetPet.Layered]::Draw($script:PetForm.Handle, $hbNow, $entry.W, $entry.H, $px, $py, [byte]255)
+        if (($script:PetPhys -or $script:PetDrag) -and $script:PetOverlay -and $script:PetOverlay.Visible) { try { Hide-PetOverlay } catch { } }
         $script:PetX = $px
         $script:PetY = $py
         $script:PetLastDrawX = $px
@@ -5466,7 +5466,7 @@ function New-PetMenu {
                 Set-PetSettingValue -Name 'petFps' -Value $v
                 # 帧缓存是按旧帧率插值的,得清掉重来
                 foreach ($k in @($script:PetCache.Keys)) {
-                    foreach ($hb in $script:PetCache[$k].Hbs) { [CampusNetPet.Layered]::FreeHBitmap($hb) }
+                    foreach ($hb in @($script:PetCache[$k].Hbs.Values)) { [CampusNetPet.Layered]::FreeHBitmap($hb) }
                 }
                 $script:PetCache = @{}
                 $script:PetLastIdx = -1
@@ -5891,7 +5891,7 @@ function Stop-Pet {
     $script:PetForm = $null
     if ($script:PetSw) { $script:PetSw.Stop(); $script:PetSw = $null }
     foreach ($k in @($script:PetCache.Keys)) {
-        foreach ($hb in $script:PetCache[$k].Hbs) { [CampusNetPet.Layered]::FreeHBitmap($hb) }
+        foreach ($hb in @($script:PetCache[$k].Hbs.Values)) { [CampusNetPet.Layered]::FreeHBitmap($hb) }
     }
     $script:PetCache = @{}
     foreach ($k in @($script:PetMemeCache.Keys)) { try { $script:PetMemeCache[$k].Dispose() } catch { } }
