@@ -1,6 +1,6 @@
 # 校园网自动登录(托盘 + 开机自启 + 多账号 + WiFi + 校时 + 网速 + 一键诊断 + 通知中心 + 唤醒重认证 + 自动修复 + 桌宠)
 
-![version](https://img.shields.io/badge/version-1.1.3-blue)
+![version](https://img.shields.io/badge/version-1.1.5-blue)
 
 **校园网自动认证登录 / WiFi 自动认证登录** —— Windows 装一次,之后开机自动连校园无线网、自动完成 Portal 认证、掉线自动重连。宿舍 WiFi(ChinaNet / CMCC-EDU / 沃 WiFi)、教学楼认证页都适用。
 
