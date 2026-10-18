@@ -103,7 +103,7 @@ $VbsFile    = Join-Path $WorkDir 'run-hidden.vbs'
 $TaskName   = 'CampusNet-AutoLogin'
 $RepairTaskName = 'CampusNet-Repair'
 $UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-$script:AppVersion = '1.1.9'
+$script:AppVersion = '1.2.0'
 $Curl = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
 $script:NicList = $null
 $script:NicListAt = [datetime]::MinValue
@@ -4214,8 +4214,50 @@ function Save-PetPos {
     } catch { }
 }
 
+# ---------- 宠物菜单的勾选:菜单只建一次,勾必须能跟着设置重算 ----------
+# 以前是「建菜单时算一次」,所以把帧率改成 48Hz 再打开菜单,勾还停在 60Hz 上。
+function Set-PetMenuCheck {
+    # Name = 设置名,Value = 这一项的取值;petOverlayWH 是「宽,高」的组合项
+    param($Item, [string]$Name, $Value, [double]$Tol = 0.01, $Snapshot)
+    $Item | Add-Member -NotePropertyName PetCheckName -NotePropertyValue $Name -Force
+    $Item | Add-Member -NotePropertyName PetCheckValue -NotePropertyValue $Value -Force
+    $Item | Add-Member -NotePropertyName PetCheckTol -NotePropertyValue $Tol -Force
+    Sync-PetMenuChecks -Items @($Item) -Snapshot $Snapshot
+}
+
+function Sync-PetMenuChecks {
+    param($Items, $Snapshot)
+    if ($null -eq $Snapshot) { try { $Snapshot = Get-Settings } catch { $Snapshot = $null } }
+    foreach ($it in @($Items)) {
+        $was = $false
+        try { $was = [bool]$it.Checked } catch { }
+        try {
+            if ($Snapshot -and $it.PSObject.Properties['PetCheckName']) {
+                $nm = [string]$it.PetCheckName
+                if ($nm -eq 'petOverlayWH') {
+                    $p2 = @(([string]$it.PetCheckValue) -split ',')
+                    $it.Checked = ([int]$Snapshot.petOverlayW -eq [int]$p2[0] -and [int]$Snapshot.petOverlayH -eq [int]$p2[1])
+                } else {
+                    $cur = $it.PetCheckValue
+                    if ($Snapshot.PSObject.Properties[$nm]) { $cur = $Snapshot.PSObject.Properties[$nm].Value }
+                    # Tol < 0 表示开关类(直接按真假)
+                    if ([double]$it.PetCheckTol -lt 0) { $it.Checked = [bool]$cur }
+                    else { $it.Checked = ([Math]::Abs([double]$cur - [double]$it.PetCheckValue) -le [double]$it.PetCheckTol) }
+                }
+            }
+        } catch { }
+        try { if ([bool]$it.Checked -ne $was) { $script:PetCheckChanged = [int]$script:PetCheckChanged + 1 } } catch { }
+        if ($it -is [System.Windows.Forms.ToolStripMenuItem] -and $it.DropDownItems.Count -gt 0) {
+            Sync-PetMenuChecks -Items $it.DropDownItems -Snapshot $Snapshot
+        }
+    }
+}
+
 function New-PetMenu {
     $menu = New-Object System.Windows.Forms.ContextMenuStrip
+    # 勾选状态统一用这一份快照,免得每个选项都去读一遍 settings.json
+    $snap = $null
+    try { $snap = Get-Settings } catch { }
 
     $miActions = New-Object System.Windows.Forms.ToolStripMenuItem
     $miActions.Text = '动作'
@@ -4249,7 +4291,7 @@ function New-PetMenu {
     foreach ($opt in @(@{ m = 0; t = '关' }, @{ m = 1; t = '每 1 分钟' }, @{ m = 5; t = '每 5 分钟' }, @{ m = 15; t = '每 15 分钟' }, @{ m = 30; t = '每 30 分钟' })) {
         $mi = New-Object System.Windows.Forms.ToolStripMenuItem
         $mi.Text = [string]$opt.t
-        $mi.Checked = ($cur -eq [int]$opt.m)
+        Set-PetMenuCheck -Item $mi -Name 'petRandomMin' -Value ([int]$opt.m) -Tol 0 -Snapshot $snap
         $mi.Tag = [int]$opt.m
         $mi.add_Click({
                 param($sender, $e)
@@ -4267,7 +4309,7 @@ function New-PetMenu {
     $miWander = New-Object System.Windows.Forms.ToolStripMenuItem
     $miWander.Text = '随机走动'
     $miWander.CheckOnClick = $true
-    $miWander.Checked = [bool](Get-PetSetting -Name 'petWander' -Default $true)
+    Set-PetMenuCheck -Item $miWander -Name 'petWander' -Value $true -Tol -1 -Snapshot $snap
     $miWander.add_Click({
             param($sender, $e)
             Set-PetSettingValue -Name 'petWander' -Value ([bool]$sender.Checked)
@@ -4278,7 +4320,7 @@ function New-PetMenu {
     $miWeather = New-Object System.Windows.Forms.ToolStripMenuItem
     $miWeather.Text = '悬停显示天气(联网定位)'
     $miWeather.CheckOnClick = $true
-    $miWeather.Checked = [bool](Get-PetSetting -Name 'petWeather' -Default $true)
+    Set-PetMenuCheck -Item $miWeather -Name 'petWeather' -Value $true -Tol -1 -Snapshot $snap
     $miWeather.add_Click({
             param($sender, $e)
             Set-PetSettingValue -Name 'petWeather' -Value ([bool]$sender.Checked)
@@ -4292,7 +4334,7 @@ function New-PetMenu {
     foreach ($opt in @(0.6, 0.8, 1.0, 1.25, 1.5, 2.0)) {
         $mi = New-Object System.Windows.Forms.ToolStripMenuItem
         $mi.Text = ('{0}%' -f [int][Math]::Round($opt * 100))
-        $mi.Checked = ([Math]::Abs($curSize - $opt) -lt 0.01)
+        Set-PetMenuCheck -Item $mi -Name 'petScale' -Value ([double]$opt) -Tol 0.01 -Snapshot $snap
         $mi.Tag = [double]$opt
         $mi.add_Click({
                 param($sender, $e)
@@ -4310,7 +4352,7 @@ function New-PetMenu {
     foreach ($opt in @(@{ v = 8; t = '小' }, @{ v = 9.5; t = '中' }, @{ v = 11; t = '大' }, @{ v = 13; t = '特大' })) {
         $mi = New-Object System.Windows.Forms.ToolStripMenuItem
         $mi.Text = [string]$opt.t
-        $mi.Checked = ([Math]::Abs($curFont - [double]$opt.v) -lt 0.01)
+        Set-PetMenuCheck -Item $mi -Name 'petOverlayFont' -Value ([double]$opt.v) -Tol 0.01 -Snapshot $snap
         $mi.Tag = [double]$opt.v
         $mi.add_Click({
                 param($sender, $e)
@@ -4329,7 +4371,7 @@ function New-PetMenu {
     foreach ($opt in @(@{ v = 0.7; t = '70%' }, @{ v = 0.85; t = '85%' }, @{ v = 1.0; t = '不透明' })) {
         $mi = New-Object System.Windows.Forms.ToolStripMenuItem
         $mi.Text = [string]$opt.t
-        $mi.Checked = ([Math]::Abs($curAlpha - [double]$opt.v) -lt 0.02)
+        Set-PetMenuCheck -Item $mi -Name 'petOverlayOpacity' -Value ([double]$opt.v) -Tol 0.02 -Snapshot $snap
         $mi.Tag = [double]$opt.v
         $mi.add_Click({
                 param($sender, $e)
@@ -4356,7 +4398,7 @@ function New-PetMenu {
         )) {
         $mi = New-Object System.Windows.Forms.ToolStripMenuItem
         $mi.Text = [string]$opt.t
-        $mi.Checked = ($curOW -eq [int]$opt.w -and $curOH -eq [int]$opt.h)
+        Set-PetMenuCheck -Item $mi -Name 'petOverlayWH' -Value ([string]$opt.w + ',' + [string]$opt.h) -Tol 0 -Snapshot $snap
         $mi.Tag = ([string]$opt.w + ',' + [string]$opt.h)
         $mi.add_Click({
                 param($sender, $e)
@@ -4399,7 +4441,7 @@ function New-PetMenu {
         )) {
         $mi = New-Object System.Windows.Forms.ToolStripMenuItem
         $mi.Text = [string]$opt.t
-        $mi.Checked = ($curFps -eq [int]$opt.v)
+        Set-PetMenuCheck -Item $mi -Name 'petFps' -Value ([int]$opt.v) -Tol 0 -Snapshot $snap
         $mi.Tag = [int]$opt.v
         $mi.add_Click({
                 param($sender, $e)
@@ -4426,7 +4468,7 @@ function New-PetMenu {
     foreach ($opt in @(@{ g = 900; t = '轻盈' }, @{ g = 1400; t = '标准' }, @{ g = 2200; t = '厚重' })) {
         $mi = New-Object System.Windows.Forms.ToolStripMenuItem
         $mi.Text = [string]$opt.t
-        $mi.Checked = ([Math]::Abs([double]$cfgNow.Gravity - [double]$opt.g) -lt 1)
+        Set-PetMenuCheck -Item $mi -Name 'petGravity' -Value ([int]$opt.g) -Tol 1 -Snapshot $snap
         $mi.Tag = [int]$opt.g
         $mi.add_Click({
                 param($sender, $e)
@@ -4443,7 +4485,7 @@ function New-PetMenu {
     foreach ($opt in @(@{ v = 0.5; t = '低' }, @{ v = 0.78; t = '标准' }, @{ v = 0.95; t = '高' })) {
         $mi = New-Object System.Windows.Forms.ToolStripMenuItem
         $mi.Text = [string]$opt.t
-        $mi.Checked = ([Math]::Abs([double]$cfgNow.Restitution - [double]$opt.v) -lt 0.02)
+        Set-PetMenuCheck -Item $mi -Name 'petRestitution' -Value ([double]$opt.v) -Tol 0.02 -Snapshot $snap
         $mi.Tag = [double]$opt.v
         $mi.add_Click({
                 param($sender, $e)
@@ -4459,7 +4501,7 @@ function New-PetMenu {
     foreach ($opt in @(@{ v = 1.0; t = '小' }, @{ v = 2.5; t = '标准' }, @{ v = 5.0; t = '大' })) {
         $mi = New-Object System.Windows.Forms.ToolStripMenuItem
         $mi.Text = [string]$opt.t
-        $mi.Checked = ([Math]::Abs([double]$cfgNow.Friction - [double]$opt.v) -lt 0.05)
+        Set-PetMenuCheck -Item $mi -Name 'petGroundFriction' -Value ([double]$opt.v) -Tol 0.05 -Snapshot $snap
         $mi.Tag = [double]$opt.v
         $mi.add_Click({
                 param($sender, $e)
@@ -4473,7 +4515,7 @@ function New-PetMenu {
     $miCeil = New-Object System.Windows.Forms.ToolStripMenuItem
     $miCeil.Text = '顶部反弹'
     $miCeil.CheckOnClick = $true
-    $miCeil.Checked = [bool]$cfgNow.CeilingBounce
+    Set-PetMenuCheck -Item $miCeil -Name 'petCeilingBounce' -Value $true -Tol -1 -Snapshot $snap
     $miCeil.add_Click({
             param($sender, $e)
             Set-PetSettingValue -Name 'petCeilingBounce' -Value ([bool]$sender.Checked)
@@ -4489,7 +4531,7 @@ function New-PetMenu {
     $miSayOn = New-Object System.Windows.Forms.ToolStripMenuItem
     $miSayOn.Text = '自动碎碎念'
     $miSayOn.CheckOnClick = $true
-    $miSayOn.Checked = [bool]$cfgNow.Say
+    Set-PetMenuCheck -Item $miSayOn -Name 'petSay' -Value $true -Tol -1 -Snapshot $snap
     $miSayOn.add_Click({
             param($sender, $e)
             Set-PetSettingValue -Name 'petSay' -Value ([bool]$sender.Checked)
@@ -4509,7 +4551,7 @@ function New-PetMenu {
         )) {
         $mi = New-Object System.Windows.Forms.ToolStripMenuItem
         $mi.Text = [string]$opt.t
-        $mi.Checked = ($curEvery -eq [int]$opt.m)
+        Set-PetMenuCheck -Item $mi -Name 'petSayEvery' -Value ([int]$opt.m) -Tol 0 -Snapshot $snap
         $mi.Tag = [int]$opt.m
         $mi.add_Click({
                 param($sender, $e)
@@ -4534,7 +4576,7 @@ function New-PetMenu {
         )) {
         $mi = New-Object System.Windows.Forms.ToolStripMenuItem
         $mi.Text = [string]$opt.t
-        $mi.Checked = ([Math]::Abs($curDur - [double]$opt.s) -lt 0.01)
+        Set-PetMenuCheck -Item $mi -Name 'petSayDur' -Value ([double]$opt.s) -Tol 0.01 -Snapshot $snap
         $mi.Tag = [double]$opt.s
         $mi.add_Click({
                 param($sender, $e)
@@ -4658,6 +4700,17 @@ function Start-Pet {
     $form.Location = New-Object System.Drawing.Point -ArgumentList $script:PetX, $script:PetY
     $script:PetMenu = New-PetMenu
     $form.ContextMenuStrip = $script:PetMenu
+    # 菜单只在宠物启动时建一次 —— 每次弹出前按最新设置重算勾选,
+    # 否则改成 48Hz 再打开菜单,勾还留在 60Hz 上。
+    $script:PetMenu.add_Opening({
+            try {
+                $script:PetCheckChanged = 0
+                Sync-PetMenuChecks -Items $script:PetMenu.Items
+                if ([int]$script:PetCheckChanged -gt 0) {
+                    Write-Log ('宠物菜单勾选已按最新设置重算(' + [int]$script:PetCheckChanged + ' 项变化)')
+                }
+            } catch { }
+        })
     # 点菜单外面自动关闭(窗口 TopMost 且没有焦点时,默认行为常常不收起)
     $script:PetMenuGuard = New-Object System.Windows.Forms.Timer
     $script:PetMenuGuard.Interval = 40
@@ -5170,9 +5223,10 @@ function Invoke-Tray {
     [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 
     $itemExit = New-Object System.Windows.Forms.ToolStripMenuItem
-    $itemExit.Text = '退出托盘(同时停止守护)'
+    $itemExit.Text = '退出托盘(同时停止守护和桌宠)'
     $itemExit.add_Click({
             Stop-Watcher
+            Stop-PetProcess
             $script:TrayNotify.Visible = $false
             $script:TrayNotify.Dispose()
             [System.Windows.Forms.Application]::Exit()
@@ -6248,6 +6302,165 @@ function Set-TerminalBackground {
     return $true
 }
 
+# ================= 退出程序时的三个选择 =================
+function Set-ProgramWindowMinimized {
+    # 「最小化程序」:窗口收起来,进程照跑。
+    # Windows Terminal 里控制台窗口本身是隐藏的,这时退一步把前台窗口(基本就是那个终端)最小化。
+    if (-not ('CampusNetWin32' -as [type])) {
+        try {
+            $cs = @'
+using System;
+using System.Runtime.InteropServices;
+public class CampusNetWin32 {
+    [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+}
+'@
+            Add-Type -TypeDefinition $cs -Language CSharp
+        } catch { }
+    }
+    if (-not ('CampusNetWin32' -as [type])) { return $false }
+    $h = [CampusNetWin32]::GetConsoleWindow()
+    if ($h -ne [IntPtr]::Zero -and [CampusNetWin32]::IsWindowVisible($h)) { return [CampusNetWin32]::ShowWindow($h, 6) }
+    $fg = [CampusNetWin32]::GetForegroundWindow()
+    if ($fg -ne [IntPtr]::Zero) { return [CampusNetWin32]::ShowWindow($fg, 6) }
+    return $false
+}
+
+function Stop-PetProcess {
+    # 只停「单独跑的桌宠进程」(-Mode pet);托盘自带的那个跟着托盘一起停
+    foreach ($p in (Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue)) {
+        if ($p.ProcessId -ne $PID -and $p.CommandLine -match 'Connect-CampusNet\.ps1' -and $p.CommandLine -match '\-Mode\s+pet') {
+            try { Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop; Write-Log ('已停止独立桌宠 pid=' + $p.ProcessId) 'OK' } catch { }
+        }
+    }
+}
+
+function Start-PetStandalone {
+    # 「只保留桌宠」:托盘和守护都停掉,单开一个隐藏的桌宠进程,关掉窗口也不会把它带走
+    foreach ($p in (Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue)) {
+        if ($p.ProcessId -ne $PID -and $p.CommandLine -match 'Connect-CampusNet\.ps1' -and $p.CommandLine -match '\-Mode\s+pet') { return $true }
+    }
+    try {
+        $s = Get-Settings
+        if (-not [bool]$s.pet) {
+            $s.pet = $true
+            Save-Settings -Settings $s
+        }
+        Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -Mode pet -Background' -f $SelfScript)
+        Write-Log '已单独拉起桌宠进程(托盘与守护已停)' 'OK'
+        return $true
+    } catch {
+        Write-Log ('单独拉起桌宠失败:' + $_.Exception.Message) 'WARN'
+        return $false
+    }
+}
+
+function Show-ExitChooser {
+    # 关程序窗口前问一句:完全退出 / 只留桌宠 / 最小化
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    $f = New-Object System.Windows.Forms.Form
+    $f.Text = '退出校园网自动登录'
+    $f.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+    $f.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+    $f.MaximizeBox = $false
+    $f.MinimizeBox = $false
+    $f.TopMost = $true
+    $f.ClientSize = [System.Drawing.Size]::new(472, 286)
+
+    $lb = New-Object System.Windows.Forms.Label
+    $lb.Text = '程序窗口要关掉了,你想留下什么?'
+    $lb.Location = [System.Drawing.Point]::new(18, 14)
+    $lb.Size = [System.Drawing.Size]::new(436, 26)
+    try { $lb.Font = [System.Drawing.Font]::new('Microsoft YaHei UI', 10.5, [System.Drawing.FontStyle]::Bold) } catch { }
+    $f.Controls.Add($lb)
+
+    $script:ExitChoice = 'cancel'
+    foreach ($o in @(
+            @{ t = '完全退出程序 —— 托盘、守护、桌宠全停'; v = 'quit'; y = 54 },
+            @{ t = '只保留桌宠 —— 停托盘和守护,桌宠留在桌面'; v = 'pet'; y = 106 },
+            @{ t = '最小化程序 —— 窗口收起来,一切照常跑'; v = 'min'; y = 158 }
+        )) {
+        $b = New-Object System.Windows.Forms.Button
+        $b.Text = [string]$o.t
+        $b.Location = [System.Drawing.Point]::new(18, [int]$o.y)
+        $b.Size = [System.Drawing.Size]::new(436, 44)
+        $b.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+        $b.Tag = [string]$o.v
+        $b.add_Click({
+                param($snd, $e)
+                $script:ExitChoice = [string]$snd.Tag
+                $snd.FindForm().Close()
+            })
+        if ($o.v -eq 'min') { $f.AcceptButton = $b }
+        $f.Controls.Add($b)
+    }
+
+    $bCancel = New-Object System.Windows.Forms.Button
+    $bCancel.Text = '取消(Esc) —— 回到菜单'
+    $bCancel.Location = [System.Drawing.Point]::new(18, 232)
+    $bCancel.Size = [System.Drawing.Size]::new(250, 36)
+    $bCancel.Tag = 'cancel'
+    $bCancel.add_Click({
+            param($snd, $e)
+            $script:ExitChoice = 'cancel'
+            $snd.FindForm().Close()
+        })
+    $f.CancelButton = $bCancel
+    $f.Controls.Add($bCancel)
+
+    [void]$f.ShowDialog()
+    $r = $script:ExitChoice
+    try { $f.Dispose() } catch { }
+    return $r
+}
+
+function Invoke-ExitChoice {
+    # 返回 'exit' = 真的退出脚本;'stay' = 回到菜单继续跑
+    param([string]$Choice)
+    switch ($Choice) {
+        'quit' {
+            Stop-Watcher
+            [void](Stop-Tray)
+            Stop-PetProcess
+            Write-Stdout ''
+            Write-Stdout '已完全退出:守护、托盘、桌宠都停了。'
+            Write-Stdout '开机自启还在,下次登录 Windows 会自己起来(不想要就选 10 卸载开机自启)。'
+            Write-Log '用户选择:完全退出程序' 'OK'
+            return 'exit'
+        }
+        'pet' {
+            Stop-Watcher
+            [void](Stop-Tray)
+            Start-Sleep -Milliseconds 400
+            Write-Stdout ''
+            if (Start-PetStandalone) {
+                Write-Stdout '只留下桌宠:托盘和守护已停,桌宠继续待命(右键桌宠可以打开菜单 / 隐藏它)'
+            } else {
+                Write-Stdout '想只留桌宠,但单独拉起桌宠失败 —— 看日志(菜单 L)里的原因'
+            }
+            Write-Log '用户选择:只保留桌宠' 'OK'
+            return 'exit'
+        }
+        'min' {
+            Write-Stdout ''
+            if (Set-ProgramWindowMinimized) {
+                Write-Stdout '窗口已最小化:程序继续在后台跑,从任务栏点回来就行'
+            } else {
+                Write-Stdout '没法自动最小化,请手动点窗口右上角的最小化;程序会继续运行'
+            }
+            return 'stay'
+        }
+        default {
+            Write-Stdout '已取消退出'
+            return 'stay'
+        }
+    }
+}
+
 # ================= 菜单 =================
 function Show-Menu {
     while ($true) {
@@ -6309,7 +6522,7 @@ function Show-Menu {
         Write-Stdout '  C) 采集诊断包(远程排查用,自动复制到剪贴板)'
         Write-Stdout '  G) 新手向导(问一句是不是校园网 + 认门户)'
         Write-Stdout '  L) 查看日志'
-        Write-Stdout '  0) 退出'
+        Write-Stdout '  0) 退出(可选:完全退出 / 只保留桌宠 / 最小化)'
         Write-Stdout '=================================================='
         $c = (Read-Host '请选择').Trim().ToUpper()
 
@@ -6409,7 +6622,10 @@ function Show-Menu {
             'L' { Show-Log }
             'C' { Invoke-Collect }
             'G' { Invoke-Wizard }
-            '0' { return }
+            '0' {
+                $script:MenuExit = Invoke-ExitChoice -Choice (Show-ExitChooser)
+                if ($script:MenuExit -eq 'exit') { return }
+            }
             default { Write-Stdout '无效选择' }
         }
     }
@@ -6606,6 +6822,8 @@ switch ($Mode) {
             Invoke-Wizard
         }
         Show-Menu
+        # 选过「完全退出 / 只保留桌宠」就别再把托盘拉回来了
+        if ($script:MenuExit -eq 'exit') { exit 0 }
         # 菜单关掉之后:装了自启就把托盘拉回来;没装就明确告诉用户为啥没有常驻图标
         if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
             [void](Start-TrayIfNeeded)
