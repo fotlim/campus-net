@@ -103,7 +103,7 @@ $VbsFile    = Join-Path $WorkDir 'run-hidden.vbs'
 $TaskName   = 'CampusNet-AutoLogin'
 $RepairTaskName = 'CampusNet-Repair'
 $UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-$script:AppVersion = '1.1.8'
+$script:AppVersion = '1.1.9'
 $Curl = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
 $script:NicList = $null
 $script:NicListAt = [datetime]::MinValue
@@ -135,6 +135,8 @@ function Get-Settings {
         petOverlayW     = 0
         petOverlayH     = 0
         petFps          = 60
+        petSayEvery     = 6
+        petSayDur       = 0
         petOverlayFont  = 9.5
         petOverlayOpacity = 0.94
     }
@@ -165,6 +167,8 @@ function Get-Settings {
         if (-not $s.PSObject.Properties['petOverlayW']) { $s | Add-Member -NotePropertyName petOverlayW -NotePropertyValue 0 -Force }
         if (-not $s.PSObject.Properties['petOverlayH']) { $s | Add-Member -NotePropertyName petOverlayH -NotePropertyValue 0 -Force }
         if (-not $s.PSObject.Properties['petFps']) { $s | Add-Member -NotePropertyName petFps -NotePropertyValue 60 -Force }
+        if (-not $s.PSObject.Properties['petSayEvery']) { $s | Add-Member -NotePropertyName petSayEvery -NotePropertyValue 6 -Force }
+        if (-not $s.PSObject.Properties['petSayDur']) { $s | Add-Member -NotePropertyName petSayDur -NotePropertyValue 0 -Force }
         if (-not $s.PSObject.Properties['petOverlayFont'] -or [double]$s.petOverlayFont -le 0) { $s | Add-Member -NotePropertyName petOverlayFont -NotePropertyValue 9.5 -Force }
         if (-not $s.PSObject.Properties['petOverlayOpacity'] -or [double]$s.petOverlayOpacity -le 0) { $s | Add-Member -NotePropertyName petOverlayOpacity -NotePropertyValue 0.94 -Force }
         return $s
@@ -198,6 +202,8 @@ function Save-Settings {
         petOverlayW     = [int]$(if ($Settings.petOverlayW) { $Settings.petOverlayW } else { 0 })
         petOverlayH     = [int]$(if ($Settings.petOverlayH) { $Settings.petOverlayH } else { 0 })
         petFps          = [int]$(if ($Settings.petFps) { $Settings.petFps } else { 60 })
+        petSayEvery     = [int]$(if ($null -ne $Settings.petSayEvery) { $Settings.petSayEvery } else { 6 })
+        petSayDur       = [double]$(if ($null -ne $Settings.petSayDur) { $Settings.petSayDur } else { 0 })
         petOverlayFont  = [double]$(if ($Settings.petOverlayFont) { $Settings.petOverlayFont } else { 9.5 })
         petOverlayOpacity = [double]$(if ($Settings.petOverlayOpacity) { $Settings.petOverlayOpacity } else { 0.94 })
     } | ConvertTo-Json | Set-Content -Path $SettingsFn -Encoding UTF8
@@ -3062,6 +3068,8 @@ function Get-PetCfg {
         OverlayOpacity = $(if ($s -and $s.PSObject.Properties['petOverlayOpacity'] -and [double]$s.petOverlayOpacity -gt 0) { [double]$s.petOverlayOpacity } else { 0.94 })
         OverlayW       = $(if ($s -and $s.PSObject.Properties['petOverlayW'] -and [int]$s.petOverlayW -gt 0) { [int]$s.petOverlayW } else { 0 })
         Fps            = $(if ($s -and $s.PSObject.Properties['petFps'] -and [int]$s.petFps -ge 12) { [int]$s.petFps } else { 60 })
+        SayEvery       = $(if ($s -and $s.PSObject.Properties['petSayEvery']) { [int]$s.petSayEvery } else { 6 })
+        SayDur         = $(if ($s -and $s.PSObject.Properties['petSayDur']) { [double]$s.petSayDur } else { 0 })
         OverlayH       = $(if ($s -and $s.PSObject.Properties['petOverlayH'] -and [int]$s.petOverlayH -gt 0) { [int]$s.petOverlayH } else { 0 })
         Gravity        = $(if ($s -and $s.PSObject.Properties['petGravity'] -and [int]$s.petGravity -gt 0) { [double]$s.petGravity } else { 1400 })
         Restitution    = $(if ($s -and $s.PSObject.Properties['petRestitution']) { [double]$s.petRestitution } else { 0.78 })
@@ -4036,7 +4044,12 @@ function Show-PetSaying {
     param([string]$Text)
     $list = Get-PetSayings
     if (-not $Text) { $Text = [string]$list[(Get-Random -Maximum $list.Count)] }
-    $script:PetSayUntil = (Get-Date).AddSeconds(4.5)
+
+    # 气泡时长:设了固定秒数就用它,设 0 就每次随机 2~6 秒
+    $dur = 0.0
+    try { $dur = [double](Get-PetCfg).SayDur } catch { }
+    if ($dur -le 0) { $dur = [Math]::Round((Get-Random -Minimum 2.0 -Maximum 6.0), 1) }
+    $script:PetSayUntil = (Get-Date).AddSeconds($dur)
     Set-PetOverlayContent -Kind 'say' -Meme $null -Text $Text
 }
 
@@ -4151,6 +4164,15 @@ function Update-Pet {
         }
     }
 
+    # 随机自动碎碎念(和「随机动作间隔」分开:这个是随机时长随机触发)
+    $sayEvery = [int]$cfg.SayEvery
+    if ($cfg.Say -and $sayEvery -gt 0 -and -not $script:PetAction -and -not $script:PetTarget -and $now -gt $script:PetNextSay) {
+        $lo = [Math]::Max(1, [int]($sayEvery * 0.5))
+        $hi = [Math]::Max($lo + 1, [int]($sayEvery * 1.5))
+        $script:PetNextSay = $now.AddMinutes((Get-Random -Minimum $lo -Maximum ($hi + 1)))
+        if (-not ($script:PetOverlay -and $script:PetOverlay.Visible)) { Show-PetSaying }
+    }
+
     # 随机动作 / 表情包
     $randMin = [int]$cfg.RandomMin
     if ($randMin -gt 0 -and $now -gt $script:PetNextRandom -and -not $script:PetAction -and -not $script:PetTarget) {
@@ -4220,10 +4242,9 @@ function New-PetMenu {
     [void]$miActions.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
     [void]$miActions.DropDownItems.Add($miRandomNow)
     [void]$miActions.DropDownItems.Add($miMeme)
-    [void]$menu.Items.Add($miActions)
-
+    [void]$miActions.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
     $miInterval = New-Object System.Windows.Forms.ToolStripMenuItem
-    $miInterval.Text = '随机动作间隔'
+    $miInterval.Text = '随机间隔'
     $cur = [int](Get-PetSetting -Name 'petRandomMin' -Default 5)
     foreach ($opt in @(@{ m = 0; t = '关' }, @{ m = 1; t = '每 1 分钟' }, @{ m = 5; t = '每 5 分钟' }, @{ m = 15; t = '每 15 分钟' }, @{ m = 30; t = '每 30 分钟' })) {
         $mi = New-Object System.Windows.Forms.ToolStripMenuItem
@@ -4233,12 +4254,15 @@ function New-PetMenu {
         $mi.add_Click({
                 param($sender, $e)
                 Set-PetSettingValue -Name 'petRandomMin' -Value ([int]$sender.Tag)
+                $script:PetCfg = $null; $script:PetCfgAt = [datetime]::MinValue
                 $script:PetNextRandom = (Get-Date).AddMinutes([int]$sender.Tag)
                 Write-Log ('宠物随机动作间隔改为: ' + $sender.Text)
             })
         [void]$miInterval.DropDownItems.Add($mi)
     }
-    [void]$menu.Items.Add($miInterval)
+    [void]$miActions.DropDownItems.Add($miInterval)
+    [void]$menu.Items.Add($miActions)
+
 
     $miWander = New-Object System.Windows.Forms.ToolStripMenuItem
     $miWander.Text = '随机走动'
@@ -4458,19 +4482,71 @@ function New-PetMenu {
     [void]$miPhys.DropDownItems.Add($miCeil)
     [void]$menu.Items.Add($miPhys)
 
-    # 碎碎念
+    # 碎碎念(开关 + 随机触发间隔 + 气泡时长)
     $miSay = New-Object System.Windows.Forms.ToolStripMenuItem
     $miSay.Text = '碎碎念'
+
     $miSayOn = New-Object System.Windows.Forms.ToolStripMenuItem
-    $miSayOn.Text = '随机碎碎念'
+    $miSayOn.Text = '自动碎碎念'
     $miSayOn.CheckOnClick = $true
     $miSayOn.Checked = [bool]$cfgNow.Say
     $miSayOn.add_Click({
             param($sender, $e)
             Set-PetSettingValue -Name 'petSay' -Value ([bool]$sender.Checked)
             $script:PetCfg = $null; $script:PetCfgAt = [datetime]::MinValue
+            $script:PetNextSay = (Get-Date)
         })
     [void]$miSay.DropDownItems.Add($miSayOn)
+
+    $miSayEvery = New-Object System.Windows.Forms.ToolStripMenuItem
+    $miSayEvery.Text = '随机触发'
+    $curEvery = [int](Get-PetSetting -Name 'petSayEvery' -Default 6)
+    foreach ($opt in @(
+            @{ m = 0; t = '关(只跟随机动作一起)' },
+            @{ m = 6; t = '频繁:每 3~10 分钟' },
+            @{ m = 20; t = '一般:每 10~30 分钟' },
+            @{ m = 60; t = '偶尔:每 30~90 分钟' }
+        )) {
+        $mi = New-Object System.Windows.Forms.ToolStripMenuItem
+        $mi.Text = [string]$opt.t
+        $mi.Checked = ($curEvery -eq [int]$opt.m)
+        $mi.Tag = [int]$opt.m
+        $mi.add_Click({
+                param($sender, $e)
+                $v = [int]$sender.Tag
+                Set-PetSettingValue -Name 'petSayEvery' -Value $v
+                $script:PetCfg = $null; $script:PetCfgAt = [datetime]::MinValue
+                $script:PetNextSay = (Get-Date)
+                Write-Log ('碎碎念随机触发: ' + $sender.Text)
+            })
+        [void]$miSayEvery.DropDownItems.Add($mi)
+    }
+    [void]$miSay.DropDownItems.Add($miSayEvery)
+
+    $miSayDur = New-Object System.Windows.Forms.ToolStripMenuItem
+    $miSayDur.Text = '气泡时长'
+    $curDur = [double](Get-PetSetting -Name 'petSayDur' -Default 0)
+    foreach ($opt in @(
+            @{ s = 0; t = '随机 2~6 秒' },
+            @{ s = 3; t = '3 秒' },
+            @{ s = 5; t = '5 秒' },
+            @{ s = 8; t = '8 秒' }
+        )) {
+        $mi = New-Object System.Windows.Forms.ToolStripMenuItem
+        $mi.Text = [string]$opt.t
+        $mi.Checked = ([Math]::Abs($curDur - [double]$opt.s) -lt 0.01)
+        $mi.Tag = [double]$opt.s
+        $mi.add_Click({
+                param($sender, $e)
+                Set-PetSettingValue -Name 'petSayDur' -Value ([double]$sender.Tag)
+                $script:PetCfg = $null; $script:PetCfgAt = [datetime]::MinValue
+                Write-Log ('碎碎念气泡时长: ' + $sender.Text)
+            })
+        [void]$miSayDur.DropDownItems.Add($mi)
+    }
+    [void]$miSay.DropDownItems.Add($miSayDur)
+
+    [void]$miSay.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
     $miSayNow = New-Object System.Windows.Forms.ToolStripMenuItem
     $miSayNow.Text = '说一句'
     $miSayNow.add_Click({ Show-PetSaying })
@@ -4672,6 +4748,7 @@ function Start-Pet {
     $script:PetCfg = $null
     $script:PetCfgAt = [datetime]::MinValue
     $script:PetNextRandom = (Get-Date).AddMinutes([int](Get-PetSetting -Name 'petRandomMin' -Default 5))
+    $script:PetNextSay = (Get-Date)
     $script:PetSw = New-Object System.Diagnostics.Stopwatch
     $script:PetSw.Start()
     $script:PetTickStart = Get-Date
