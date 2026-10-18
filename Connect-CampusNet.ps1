@@ -74,6 +74,9 @@ param(
     [switch]$DetectPortal,
     [switch]$AutoPortal,
 
+    # 天气:彩云天气 token(不填就用 Open-Meteo 兜底)
+    [string]$CaiyunToken,
+
     # 换一组探测地址(默认那几个外网地址;调试/内网测试时用)
     [string[]]$ProbeUrl,
 
@@ -100,7 +103,7 @@ $VbsFile    = Join-Path $WorkDir 'run-hidden.vbs'
 $TaskName   = 'CampusNet-AutoLogin'
 $RepairTaskName = 'CampusNet-Repair'
 $UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-$script:AppVersion = '1.1.3'
+$script:AppVersion = '1.1.4'
 $Curl = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
 $script:NicList = $null
 $script:NicListAt = [datetime]::MinValue
@@ -128,6 +131,7 @@ function Get-Settings {
         petCeilingBounce = $true
         petSay          = $true
         petWeatherCity  = ''
+        caiyunToken     = ''
         petOverlayFont  = 9.5
         petOverlayOpacity = 0.94
     }
@@ -154,6 +158,7 @@ function Get-Settings {
         if (-not $s.PSObject.Properties['petCeilingBounce']) { $s | Add-Member -NotePropertyName petCeilingBounce -NotePropertyValue $true -Force }
         if (-not $s.PSObject.Properties['petSay']) { $s | Add-Member -NotePropertyName petSay -NotePropertyValue $true -Force }
         if (-not $s.PSObject.Properties['petWeatherCity']) { $s | Add-Member -NotePropertyName petWeatherCity -NotePropertyValue '' -Force }
+        if (-not $s.PSObject.Properties['caiyunToken']) { $s | Add-Member -NotePropertyName caiyunToken -NotePropertyValue '' -Force }
         if (-not $s.PSObject.Properties['petOverlayFont'] -or [double]$s.petOverlayFont -le 0) { $s | Add-Member -NotePropertyName petOverlayFont -NotePropertyValue 9.5 -Force }
         if (-not $s.PSObject.Properties['petOverlayOpacity'] -or [double]$s.petOverlayOpacity -le 0) { $s | Add-Member -NotePropertyName petOverlayOpacity -NotePropertyValue 0.94 -Force }
         return $s
@@ -183,6 +188,7 @@ function Save-Settings {
         petCeilingBounce = [bool]$Settings.petCeilingBounce
         petSay          = [bool]$Settings.petSay
         petWeatherCity  = [string]$Settings.petWeatherCity
+        caiyunToken     = [string]$Settings.caiyunToken
         petOverlayFont  = [double]$(if ($Settings.petOverlayFont) { $Settings.petOverlayFont } else { 9.5 })
         petOverlayOpacity = [double]$(if ($Settings.petOverlayOpacity) { $Settings.petOverlayOpacity } else { 0.94 })
     } | ConvertTo-Json | Set-Content -Path $SettingsFn -Encoding UTF8
@@ -2751,6 +2757,8 @@ $script:PetMediaActions = $null
 $script:PetWeather = $null
 $script:PetWeatherAt = [datetime]::MinValue
 $script:PetWeatherFile = Join-Path $WorkDir 'pet-weather.json'
+# 彩云天气接口根(测试时可用环境变量指到本地假服务)
+$script:CaiyunApiBase = $(if ($env:CAMPUSNET_CAIYUN_BASE) { [string]$env:CAMPUSNET_CAIYUN_BASE } else { 'https://api.caiyunapp.com' })
 $script:PetMemeCache = @{}
 
 $script:LayeredCs = @'
@@ -3044,54 +3052,325 @@ function Get-WeatherText {
     return '—'
 }
 
-function Update-PetWeather {
-    # 优先用设置里填的城市(Open-Meteo 的地理编码);没填才退回 IP 定位
-    $out = [ordered]@{ ts = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'); ok = $false; city = ''; temp = $null; code = -1; text = '' }
-    $lat = $null; $lon = $null
+function Get-CaiyunSkyText {
+    # 彩云天气的 skycon 枚举 → 中文
+    param([string]$Skycon)
+    switch ([string]$Skycon) {
+        'CLEAR_DAY' { return '晴' }
+        'CLEAR_NIGHT' { return '晴' }
+        'PARTLY_CLOUDY_DAY' { return '多云' }
+        'PARTLY_CLOUDY_NIGHT' { return '多云' }
+        'CLOUDY' { return '阴' }
+        'LIGHT_HAZE' { return '轻度霾' }
+        'MODERATE_HAZE' { return '中度霾' }
+        'HEAVY_HAZE' { return '重度霾' }
+        'LIGHT_RAIN' { return '小雨' }
+        'MODERATE_RAIN' { return '中雨' }
+        'HEAVY_RAIN' { return '大雨' }
+        'STORM_RAIN' { return '暴雨' }
+        'FOG' { return '雾' }
+        'LIGHT_SNOW' { return '小雪' }
+        'MODERATE_SNOW' { return '中雪' }
+        'HEAVY_SNOW' { return '大雪' }
+        'STORM_SNOW' { return '暴雪' }
+        'DUST' { return '浮尘' }
+        'SAND' { return '扬沙' }
+        'WIND' { return '大风' }
+        default { return '—' }
+    }
+}
 
-    $wantCity = ''
-    try { $wantCity = [string](Get-Settings).petWeatherCity } catch { }
-    $wantCity = $wantCity.Trim()
+function Get-DressingAdvice {
+    # 穿衣提醒:按体感温度分档,再按天气加一句提醒
+    param([double]$Temp, [string]$Text = '', [double]$WindSpeed = 0)
 
-    if ($wantCity) {
-        try {
-            $u = 'https://geocoding-api.open-meteo.com/v1/search?name={0}&count=1&language=zh&format=json' -f [uri]::EscapeDataString($wantCity)
-            $g = Invoke-RestMethod -Uri $u -TimeoutSec 12 -UseBasicParsing
-            if ($g.results -and @($g.results).Count -gt 0) {
-                $r = @($g.results)[0]
-                $lat = $r.latitude; $lon = $r.longitude
-                $out.city = [string]$r.name
-                if ($r.admin1) {
-                    # 直辖市会把省市重复一次(北京 · 北京市),去掉
-                    $a1 = [string]$r.admin1
-                    if ($a1 -ne $out.city -and $a1 -ne ($out.city + '市') -and $a1 -notlike ('*' + $out.city + '*')) {
-                        $out.city = $out.city + ' · ' + $a1
+    $t = [int][Math]::Round($Temp)
+    $adv = ''
+    if ($t -ge 30) { $adv = '短袖短裤就行' }
+    elseif ($t -ge 26) { $adv = '短袖 T 恤' }
+    elseif ($t -ge 22) { $adv = '薄长袖,或短袖加件薄外套' }
+    elseif ($t -ge 18) { $adv = '长袖衬衫 / 薄卫衣' }
+    elseif ($t -ge 14) { $adv = '卫衣 / 夹克' }
+    elseif ($t -ge 10) { $adv = '外套加长裤' }
+    elseif ($t -ge 5) { $adv = '厚外套 / 毛衣' }
+    elseif ($t -ge 0) { $adv = '棉服 / 羽绒服' }
+    else { $adv = '羽绒服,帽子围巾戴上' }
+
+    $extra = @()
+    if ($Text -match '雨') { $extra += '带伞' }
+    if ($Text -match '雪') { $extra += '带伞,路滑' }
+    if ($Text -match '霾|浮尘|扬沙') { $extra += '戴口罩' }
+    if ($WindSpeed -ge 5.5) { $extra += '风大' }
+    if ($t -ge 30) { $extra += '多喝水' }
+
+    if ($extra.Count -gt 0) { return ($adv + ',' + ($extra -join ',')) }
+    return $adv
+}
+
+function Get-CnPlaceCandidates {
+    # 「吉林省长春市南关区」这种整串,地理编码基本都不认;拆成几级逐个试
+    param([string]$Text)
+    $t = ([string]$Text).Trim()
+    $list = @()
+    if (-not $t) { return $list }
+    $list += $t
+    if ($t -match '([^省]+省)?(.+)$') { }
+    # 去掉末尾的 省/市/区/县
+    $a = $t -replace '(特别行政区|自治区|省|市|区|县)$', ''
+    if ($a -and $a -ne $t) { $list += $a }
+    # 「省」后面的部分(市 + 区县)
+    if ($t -match '省(.+)$') {
+        $b = $Matches[1]
+        if ($b) { $list += $b }
+        $b2 = $b -replace '(市|区|县)$', ''
+        if ($b2 -and $b2 -ne $b) { $list += $b2 }
+    }
+    # 「市」后面的部分(区县)
+    if ($t -match '市(.+)$') {
+        $c = $Matches[1]
+        if ($c) { $list += $c }
+    }
+    return @($list | Where-Object { $_ } | Select-Object -Unique)
+}
+
+function Get-CnPlaceParts {
+    # 从 Nominatim 的 address 字段 / display_name 里按后缀归类成 省 / 市 / 区县
+    # (display_name 的层级顺序不固定,不能直接按顺序取)
+    param([string[]]$Texts)
+    $prov = ''; $city = ''; $dist = ''
+    foreach ($t in $Texts) {
+        if ([string]::IsNullOrWhiteSpace($t)) { continue }
+        foreach ($seg in ([string]$t -split ',')) {
+            $s = $seg.Trim()
+            if (-not $s) { continue }
+            if ($s -match '^(中国|China|中华人民共和国|People.s Republic of China)$') { continue }
+            if ($s -match '^\d+$') { continue }
+            if ((-not $prov) -and $s -match '(省|自治区|特别行政区)$') { $prov = $s; continue }
+            if ((-not $city) -and $s -match '(市|自治州|地区|盟)$') { $city = $s; continue }
+            if ((-not $dist) -and $s -match '(区|县|旗)$') { $dist = $s; continue }
+        }
+    }
+    return [pscustomobject]@{ Province = $prov; City = $city; District = $dist }
+}
+
+function Add-CnAdminSuffix {
+    param([string]$Name, [string]$Kind)
+    $n = ([string]$Name).Trim()
+    if (-not $n) { return '' }
+    if ($Kind -eq 'province') {
+        if ($n -match '(省|自治区|特别行政区)$') { return $n }
+        if (@('北京', '上海', '天津', '重庆') -contains $n) { return $n }
+        return ($n + '省')
+    }
+    if ($Kind -eq 'city') {
+        if ($n -match '(市|州|盟|地区|自治州|自治县)$') { return $n }
+        return ($n + '市')
+    }
+    return $n
+}
+
+function Get-WeatherPlace {
+    # 省 / 市 / 区县 —— 既用来显示,也给天气接口经纬度
+    # 顺序:Nominatim(能到区县)→ Open-Meteo(只到市)→ IP 定位(只到市)
+    param([string]$WantCity = '')
+
+    $r = [pscustomobject]@{ Label = ''; Province = ''; City = ''; District = ''; Lat = $null; Lon = $null; Ok = $false }
+
+    if ($WantCity) {
+        # 1) Nominatim:地址层级全,能拿到区县
+        foreach ($cand in (Get-CnPlaceCandidates $WantCity)) {
+            if ($r.Ok) { break }
+            try {
+                $u = 'https://nominatim.openstreetmap.org/search?q={0}&format=json&addressdetails=1&limit=1&accept-language=zh-CN' -f [uri]::EscapeDataString($cand)
+                $nr = Invoke-RestMethod -Uri $u -TimeoutSec 12 -UseBasicParsing -Headers @{ 'User-Agent' = ('campus-net/' + $script:AppVersion + ' (personal use)') }
+                if ($nr -and @($nr).Count -gt 0) {
+                    $one = @($nr)[0]
+                    $r.Lat = [double]$one.lat
+                    $r.Lon = [double]$one.lon
+                    $ad = $one.address
+                    $segs = @()
+                    if ($ad) {
+                        foreach ($fld in @($ad.state, $ad.city, $ad.town, $ad.municipality, $ad.district, $ad.county, $ad.city_district, $ad.suburb, $ad.village)) {
+                            if ($fld) { $segs += [string]$fld }
+                        }
                     }
+                    $segs += [string]$one.display_name
+                    $pp = Get-CnPlaceParts -Texts $segs
+                    $r.Province = Add-CnAdminSuffix ([string]$pp.Province) 'province'
+                    $r.City = [string]$pp.City
+                    $r.District = [string]$pp.District
+                    $lbl = @()
+                    foreach ($x in @($r.Province, $r.City, $r.District)) {
+                        $x = ([string]$x).Trim()
+                        if ($x -and ($lbl -notcontains $x)) { $lbl += $x }
+                    }
+                    if ($lbl.Count -gt 0) { $r.Label = ($lbl -join ' ') }
+                    $r.Ok = $true
+                }
+            } catch {
+                Write-Log ('Nominatim 定位失败(' + $cand + '):' + $_.Exception.Message) 'WARN'
+            }
+        }
+
+        # 2) Open-Meteo 兜底(没有区县)
+        if (-not $r.Ok) {
+            foreach ($cand in (Get-CnPlaceCandidates $WantCity)) {
+                if ($r.Ok) { break }
+                try {
+                    $u = 'https://geocoding-api.open-meteo.com/v1/search?name={0}&count=1&language=zh&format=json' -f [uri]::EscapeDataString($cand)
+                    $g = Invoke-RestMethod -Uri $u -TimeoutSec 12 -UseBasicParsing
+                    if ($g.results -and @($g.results).Count -gt 0) {
+                        $one = @($g.results)[0]
+                        $r.Lat = [double]$one.latitude
+                        $r.Lon = [double]$one.longitude
+                        $r.Province = Add-CnAdminSuffix ([string]$one.admin1) 'province'
+                        $r.City = Add-CnAdminSuffix ([string]$one.admin2) 'city'
+                        if (-not $one.admin2) { $r.City = [string]$one.name }
+                        $r.District = [string]$one.admin3
+                        $r.Ok = $true
+                    }
+                } catch {
+                    Write-Log ('天气地理编码失败(' + $cand + '):' + $_.Exception.Message) 'WARN'
                 }
             }
-        } catch { }
+        }
     }
 
-    if ($null -eq $lat) {
+    if (-not $r.Ok) {
+        # 3) IP 定位只能到市,没有区县
         try {
-            $loc = Invoke-RestMethod -Uri 'http://ip-api.com/json/?fields=status,city,regionName,country,lat,lon' -TimeoutSec 12 -UseBasicParsing
+            $loc = Invoke-RestMethod -Uri 'http://ip-api.com/json/?fields=status,country,regionName,city,lat,lon' -TimeoutSec 12 -UseBasicParsing
             if ($loc.status -eq 'success') {
-                $lat = $loc.lat; $lon = $loc.lon
-                $out.city = [string]$loc.city
-                if (-not $out.city) { $out.city = [string]$loc.regionName }
+                $r.Lat = [double]$loc.lat
+                $r.Lon = [double]$loc.lon
+                $r.Province = [string]$loc.regionName
+                $r.City = [string]$loc.city
+                $r.Ok = $true
             }
-        } catch { }
+        } catch {
+            Write-Log ('IP 定位失败:' + $_.Exception.Message) 'WARN'
+        }
     }
 
-    if ($null -ne $lat) {
+    # 没有现成标签就按 省/市/区 拼(同名只留一个)
+    if (-not $r.Label) {
+        $parts = @()
+        foreach ($p in @($r.Province, $r.City, $r.District)) {
+            $p = ([string]$p).Trim()
+            if (-not $p) { continue }
+            $dup = $false
+            foreach ($q in $parts) {
+                if ($q -eq $p -or $q -like ('*' + $p + '*') -or $p -like ('*' + $q + '*')) { $dup = $true; break }
+            }
+            if (-not $dup) { $parts += $p }
+        }
+        $r.Label = ($parts -join ' ')
+    }
+    return $r
+}
+
+function Get-CaiyunWeather {
+    # 彩云天气 v2.6:一次 weather.json 拿实时 + 穿衣指数 + 预警
+    param([string]$Token, [double]$Lat, [double]$Lon)
+
+    $r = [pscustomobject]@{ Ok = $false; Temp = $null; Text = ''; Feels = $null; Wind = 0; Dressing = ''; Alert = '' }
+    if ([string]::IsNullOrWhiteSpace($Token) -or $null -eq $Lat) { return $r }
+
+    $coord = ('{0},{1}' -f [Math]::Round($Lat, 4), [Math]::Round($Lon, 4))
+    $u = '{0}/v2.6/{1}/{2}/weather.json?alert=true&dailysteps=1' -f $script:CaiyunApiBase, $Token, $coord
+    try { $w = Invoke-RestMethod -Uri $u -TimeoutSec 15 -UseBasicParsing } catch { return $r }
+    if ([string]$w.status -ne 'ok') { return $r }
+
+    $rt = $w.result.realtime
+    if (-not $rt) { return $r }
+
+    $r.Temp = [double]$rt.temperature
+    $r.Text = Get-CaiyunSkyText -Skycon ([string]$rt.skycon)
+    if ($null -ne $rt.apparent_temperature) { $r.Feels = [double]$rt.apparent_temperature }
+    if ($rt.wind -and $null -ne $rt.wind.speed) { $r.Wind = [double]$rt.wind.speed }
+
+    # 彩云自带的穿衣指数(desc 是"较冷 / 舒适"这种等级),拿来做补充
+    try {
+        $d = $w.result.daily.life_index.dressing
+        if ($d) {
+            if (@($d).Count -gt 0) { $r.Dressing = [string](@($d)[0].desc) }
+            else { $r.Dressing = [string]$d.desc }
+        }
+    } catch { }
+
+    try {
+        $al = $w.result.alert.content
+        if ($al -and @($al).Count -gt 0) {
+            $first = @($al)[0]
+            if ($first -and $first.title) { $r.Alert = [string]$first.title }
+        }
+    } catch { }
+
+    $r.Ok = $true
+    return $r
+}
+
+function Update-PetWeather {
+    # 位置:设置里填的城市(能拿到省/市/区)→ 没填就 IP 定位(只有市)
+    # 天气:彩云天气(要 token)→ 失败或没 token 用 Open-Meteo 兜底
+    $out = [ordered]@{
+        ts = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'); ok = $false
+        city = ''; place = ''; province = ''; district = ''
+        temp = $null; feels = $null; code = -1; text = ''
+        dressing = ''; wind = 0; alert = ''; source = ''
+    }
+
+    $wantCity = ''
+    $token = ''
+    try {
+        $st = Get-Settings
+        $wantCity = [string]$st.petWeatherCity
+        $token = [string]$st.caiyunToken
+    } catch { }
+    $wantCity = $wantCity.Trim()
+    $token = $token.Trim()
+
+    $p = Get-WeatherPlace -WantCity $wantCity
+    $out.city = [string]$p.City
+    $out.place = [string]$p.Label
+    $out.province = [string]$p.Province
+    $out.district = [string]$p.District
+
+    # 1) 彩云天气
+    if ($token -and $p.Ok) {
+        $cy = Get-CaiyunWeather -Token $token -Lat $p.Lat -Lon $p.Lon
+        if ($cy.Ok) {
+            $out.temp = [int][Math]::Round([double]$cy.Temp)
+            $out.feels = $(if ($null -ne $cy.Feels) { [int][Math]::Round([double]$cy.Feels) } else { $out.temp })
+            $out.text = [string]$cy.Text
+            $out.wind = [double]$cy.Wind
+            $out.alert = [string]$cy.Alert
+            $base = Get-DressingAdvice -Temp $out.feels -Text $out.text -WindSpeed $out.wind
+            $out.dressing = $(if ($cy.Dressing) { $base + '(' + $cy.Dressing + ')' } else { $base })
+            $out.source = '彩云天气'
+            $out.ok = $true
+        } else {
+            Write-Log '彩云天气取数失败(检查 token / 城市),回退 Open-Meteo' 'WARN'
+        }
+    }
+
+    # 2) Open-Meteo 兜底
+    if (-not $out.ok -and $p.Ok) {
         try {
-            $u = 'https://api.open-meteo.com/v1/forecast?latitude={0}&longitude={1}&current=temperature_2m,weather_code' -f $lat, $lon
+            $u = 'https://api.open-meteo.com/v1/forecast?latitude={0}&longitude={1}&current=temperature_2m,apparent_temperature,weather_code,wind_speed_10m' -f $p.Lat, $p.Lon
             $w = Invoke-RestMethod -Uri $u -TimeoutSec 12 -UseBasicParsing
             $out.temp = [int][math]::Round([double]$w.current.temperature_2m)
             $out.code = [int]$w.current.weather_code
             $out.text = Get-WeatherText -Code $out.code
+            if ($null -ne $w.current.apparent_temperature) { $out.feels = [int][Math]::Round([double]$w.current.apparent_temperature) }
+            if ($null -ne $w.current.wind_speed_10m) { $out.wind = [double]$w.current.wind_speed_10m / 3.6 }
+            if ($null -eq $out.feels) { $out.feels = $out.temp }
+            $out.dressing = Get-DressingAdvice -Temp $out.feels -Text $out.text -WindSpeed $out.wind
+            $out.source = 'Open-Meteo'
             $out.ok = $true
-        } catch { }
+        } catch {
+            Write-Log ('Open-Meteo 取数失败:' + $_.Exception.Message) 'WARN'
+        }
     }
 
     try { ($out | ConvertTo-Json -Compress) | Set-Content -Path $script:PetWeatherFile -Encoding UTF8 } catch { }
@@ -3119,7 +3398,11 @@ function Get-PetWeather {
 function Format-PetWeather {
     $w = Get-PetWeather
     if (-not $w -or -not $w.ok) { return '' }
-    return [string]$w.text + ' ' + [string]$w.temp + '°C · ' + [string]$w.city
+    $line = [string]$w.text + ' ' + [string]$w.temp + '°C'
+    if ($w.place) { $line += ' · ' + [string]$w.place }
+    elseif ($w.city) { $line += ' · ' + [string]$w.city }
+    if ($w.dressing) { $line += ' · ' + [string]$w.dressing }
+    return $line
 }
 
 # ---------------- 媒体(GSMTC) ----------------
@@ -5728,8 +6011,10 @@ function Show-Menu {
             }
             'W' {
                 $curCity = [string](Get-PetSetting -Name 'petWeatherCity' -Default '')
+                $curToken = [string](Get-PetSetting -Name 'caiyunToken' -Default '')
                 Write-Stdout ('当前天气城市: ' + $(if ($curCity) { $curCity } else { '(按 IP 自动定位)' }))
-                $nc = Read-Host '输入城市名(回车取消,输入 - 表示改回按 IP 定位)'
+                Write-Stdout ('彩云天气 token: ' + $(if ($curToken) { '已配置(' + $curToken.Substring(0, [Math]::Min(4, $curToken.Length)) + '…)' } else { '未配置(用 Open-Meteo)' }))
+                $nc = Read-Host '输入城市名/区县名(回车取消,输入 - 表示改回按 IP 定位)'
                 if (-not [string]::IsNullOrWhiteSpace($nc)) {
                     $nc = $nc.Trim()
                     if ($nc -eq '-') { $nc = '' }
@@ -5737,9 +6022,22 @@ function Show-Menu {
                     $script:PetWeather = $null
                     $script:PetWeatherAt = [datetime]::MinValue
                     $w2 = Update-PetWeather
-                    if ($w2.ok) { Write-Stdout ('天气: ' + $w2.text + ' ' + $w2.temp + '°C · ' + $w2.city) }
-                    else { Write-Stdout '没查到(城市名写对了吗?或者网络被拦)' }
-                    Write-Log ('天气城市设为: ' + $(if ($nc) { $nc } else { '(按 IP 定位)' }))
+                    if ($w2.ok) {
+                        Write-Stdout ('天气: ' + $w2.text + ' ' + $w2.temp + '°C · ' + $w2.place + ' · ' + $w2.dressing + '  [' + $w2.source + ']')
+                    } else { Write-Stdout '没查到(城市名写对了吗?或者网络被拦)' }
+                    Write-Log ('天气位置设为: ' + $(if ($nc) { $nc } else { '(按 IP 定位)' }))
+                }
+
+                $nt = Read-Host '彩云天气 token(回车保持;输入 - 表示清空)'
+                if (-not [string]::IsNullOrWhiteSpace($nt)) {
+                    $nt = $nt.Trim()
+                    if ($nt -eq '-') { $nt = '' }
+                    Set-PetSettingValue -Name 'caiyunToken' -Value $nt
+                    Write-Log ('彩云 token ' + $(if ($nt) { '已更新' } else { '已清空' }))
+                    $script:PetWeather = $null
+                    $script:PetWeatherAt = [datetime]::MinValue
+                    $w3 = Update-PetWeather
+                    if ($w3.ok) { Write-Stdout ('天气: ' + $w3.text + ' ' + $w3.temp + '°C · ' + $w3.place + ' · ' + $w3.dressing + '  [' + $w3.source + ']') }
                 }
             }
             'L' { Show-Log }
@@ -5866,9 +6164,12 @@ switch ($Mode) {
 
     'weather' {
         # 联网识别位置 + 取当前天气,结果写 pet-weather.json 给悬停面板用
+        if ($CaiyunToken) { Set-PetSettingValue -Name 'caiyunToken' -Value $CaiyunToken }
         $w = Update-PetWeather
         if ($w.ok) {
-            Write-Stdout ('天气: ' + $w.text + ' ' + $w.temp + '°C · ' + $w.city)
+            Write-Stdout ('天气: ' + $w.text + ' ' + $w.temp + '°C(体感 ' + $w.feels + '°C) · ' + $w.place)
+            Write-Stdout ('穿衣: ' + $w.dressing)
+            Write-Stdout ('来源: ' + $w.source + $(if ($w.alert) { '   预警: ' + $w.alert } else { '' }))
             exit 0
         }
         Write-Stdout '拿不到位置/天气(可能没网或被拦)'
