@@ -32,7 +32,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('menu', 'setup', 'switch', 'delete', 'list', 'login', 'status', 'watch', 'tray', 'install', 'uninstall', 'synctime', 'wifi', 'doctor', 'check', 'background', 'log', 'repair', 'notify', 'nicreset', 'pet', 'weather', 'portal', 'collect')]
+    [ValidateSet('menu', 'setup', 'switch', 'delete', 'list', 'login', 'status', 'watch', 'tray', 'install', 'uninstall', 'synctime', 'wifi', 'doctor', 'check', 'background', 'log', 'repair', 'notify', 'nicreset', 'pet', 'weather', 'portal', 'collect', 'wizard')]
     [string]$Mode = 'menu',
 
     [string]$User,
@@ -100,7 +100,7 @@ $VbsFile    = Join-Path $WorkDir 'run-hidden.vbs'
 $TaskName   = 'CampusNet-AutoLogin'
 $RepairTaskName = 'CampusNet-Repair'
 $UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-$script:AppVersion = '1.1.2'
+$script:AppVersion = '1.1.3'
 $Curl = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
 $script:NicList = $null
 $script:NicListAt = [datetime]::MinValue
@@ -4898,6 +4898,272 @@ function Invoke-Collect {
     Write-Stdout '↑ 文本已经复制到剪贴板,直接粘贴发出去就行'
 }
 
+# ================= 新手向导:问一句 + 认门户 =================
+function Get-PortalFormDraft {
+    # 从门户页的 <form> 里抠出「登录接口 + 字段名」,拼一份能直接用的模板
+    param([string]$Html, [string]$PageUrl)
+
+    $d = [pscustomobject]@{
+        Ok = $false; LoginUrl = ''; Method = 'POST'
+        Template = ''; Encrypt = 'none'; UserField = ''; PwdField = ''; Note = ''
+    }
+    if ([string]::IsNullOrWhiteSpace($Html)) { return $d }
+
+    $formMatch = $null
+    foreach ($fm in [regex]::Matches($Html, '(?is)<form\b[^>]*>(.*?)</form>')) {
+        if ($fm.Groups[1].Value -match '(?is)type\s*=\s*["'']?password') { $formMatch = $fm; break }
+    }
+    if (-not $formMatch) { return $d }
+
+    $open = $formMatch.Value
+    $inner = $formMatch.Groups[1].Value
+
+    $action = ''
+    $m = [regex]::Match($open, '(?is)\baction\s*=\s*["'']([^"'']*)["'']')
+    if ($m.Success) { $action = $m.Groups[1].Value }
+
+    $method = 'POST'
+    $m2 = [regex]::Match($open, '(?is)\bmethod\s*=\s*["'']([^"'']*)["'']')
+    if ($m2.Success -and $m2.Groups[1].Value -match '(?i)get') { $method = 'GET' }
+
+    $loginUrl = $PageUrl
+    if ($action -and $action -notmatch '^(?i)javascript:|^#') {
+        if ($action -match '^(?i)https?://') { $loginUrl = $action }
+        else { try { $loginUrl = ([Uri]::new([Uri]$PageUrl, $action)).AbsoluteUri } catch { } }
+    }
+
+    $parts = @()
+    foreach ($im in [regex]::Matches($inner, '(?is)<input\b[^>]*>')) {
+        $tag = $im.Value
+        $nm = [regex]::Match($tag, '(?is)\bname\s*=\s*["'']([^"'']+)["'']')
+        if (-not $nm.Success) { continue }
+        $name = $nm.Groups[1].Value
+
+        $ty = 'text'
+        $t2 = [regex]::Match($tag, '(?is)\btype\s*=\s*["'']?([a-zA-Z]+)')
+        if ($t2.Success) { $ty = $t2.Groups[1].Value.ToLowerInvariant() }
+
+        $val = ''
+        $v2 = [regex]::Match($tag, '(?is)\bvalue\s*=\s*["'']([^"'']*)["'']')
+        if ($v2.Success) { $val = $v2.Groups[1].Value }
+
+        if ($ty -eq 'password') {
+            $parts += ($name + '={pwd}')
+            $d.PwdField = $name
+        } elseif ((-not $d.UserField) -and ($ty -match '^(text|tel|number|email|search)$') -and
+                  ($name -match '(?i)user|account|number|num|mobile|phone|card|login|name|id')) {
+            $parts += ($name + '={user}')
+            $d.UserField = $name
+        } elseif ($name -and $val) {
+            $parts += ($name + '=' + [uri]::EscapeDataString($val))
+        }
+    }
+    if (-not $d.UserField -or -not $d.PwdField -or $parts.Count -lt 2) { return $d }
+
+    $d.LoginUrl = $loginUrl
+    $d.Method = $method
+    $d.Template = ($parts -join '&')
+    $d.Ok = $true
+
+    # 猜加密(只是猜:看页面/内联脚本里有没有 md5( / rc4 / base64)
+    if ($Html -match '(?i)\bmd5\s*\(') { $d.Encrypt = 'md5' }
+    elseif ($Html -match '(?i)\brc4\b') { $d.Encrypt = 'rc4_ms' }
+    elseif ($Html -match '(?i)\bbase64\b') { $d.Encrypt = 'base64' }
+
+    $d.Note = ('从门户表单自动生成:用户字段 ' + $d.UserField + ',密码字段 ' + $d.PwdField + ',加密按页面特征猜为 ' + $d.Encrypt)
+    return $d
+}
+
+function Invoke-Wizard {
+    # 第一次用:问一句「这个 WiFi 是不是校园网」,不是就换名字;然后认门户、生成配置
+    Write-Stdout ''
+    Write-Stdout '=================================================='
+    Write-Stdout '   新手向导:认门户 + 设 WiFi'
+    Write-Stdout '=================================================='
+
+    # ---- 1. WiFi ----
+    $wi = $null
+    try { $wi = Get-WifiInfo } catch { }
+    $cur = $(if ($wi) { [string]$wi.Ssid } else { '' })
+    if ($cur) { Write-Stdout ('  当前连的 WiFi: ' + $cur) }
+    else { Write-Stdout '  当前没有连着 WiFi(或者用的是有线)' }
+
+    $target = $cur
+    if ($cur) {
+        $a1 = (Read-Host '  这个网络是「校园网 / 需要自动认证」的吗? [Y/n]').Trim().ToLowerInvariant()
+        if ($a1 -eq 'n') { $target = (Read-Host '  要自动连接的校园网 WiFi 名称').Trim() }
+    } else {
+        $target = (Read-Host '  要自动连接的校园网 WiFi 名称').Trim()
+    }
+
+    if ($target) {
+        try {
+            $s = Get-Settings
+            $s.wifiSsid = $target
+            $s.autoWifi = $true
+            Save-Settings -Settings $s
+            $script:WifiSsid = $target
+            $script:AutoWifi = $true
+            Write-Log ('向导:目标 WiFi = ' + $target + '(自动连接开)') 'OK'
+            Write-Stdout ('  ✓ 目标 WiFi 设为: ' + $target)
+        } catch {
+            Write-Stdout ('  ! 保存 WiFi 设置失败: ' + $_.Exception.Message)
+        }
+    } else {
+        Write-Stdout '  - 没填 WiFi 名称,先用原来的设置'
+    }
+
+    # ---- 2. 账号 ----
+    $store = Get-Store
+    if ($store.accounts.Count -eq 0) {
+        $a2 = (Read-Host '  还没有保存账号。现在填吗? [Y/n]').Trim().ToLowerInvariant()
+        if ($a2 -ne 'n') {
+            $u = (Read-Host '  账号(学号 / 手机号)').Trim()
+            if ($u) {
+                $pw = Read-PlainPassword '  密码'
+                if ($pw) {
+                    Set-Account -Account $u -PlainPassword $pw -MakeActive
+                    Write-Stdout '  ✓ 账号已保存(DPAPI 加密)'
+                }
+            }
+        }
+    } else {
+        Write-Stdout ('  已有账号: ' + $store.active + '(' + $store.accounts.Count + ' 个)')
+    }
+
+    # ---- 3. 认门户 ----
+    Write-Stdout ''
+    Write-Stdout '  正在识别门户(最多 15 秒)…'
+    $cap = Get-CaptiveRedirect
+    $hh = $null
+    $gw = Get-DefaultGatewayIp
+
+    if ($cap) {
+        Write-Stdout ('  抓到门户跳转: ' + $cap)
+    } else {
+        if (Test-Online) {
+            Write-Stdout '  已经在线,门户不会被劫持(想重认:先注销认证或断网重连再跑一次)'
+        } else {
+            Write-Stdout '  没抓到 HTTP 跳转,再试试 HTTPS 劫持页和网关…'
+        }
+        $hh = Get-HttpsPortalHint
+        if ($hh) { Write-Stdout ('  HTTPS 劫持页: ' + $hh.Title) }
+    }
+
+    $fp = Get-PortalFingerprint $cap
+    $applied = $false
+    if ($fp.Id) {
+        $preset = Get-PortalPreset $fp.Id
+        if ($preset) {
+            [void](Save-PortalProfile $preset)
+            $pf2 = Get-PortalProfile
+            if ($fp.Host) { $pf2.host = [string]$fp.Host }
+            if ($fp.Id -eq 'esurfing') {
+                $pf2.host = 'enet.10000.gd.cn:10001'
+                $pf2.page = ''
+            } elseif ($fp.Page -and $fp.Page -ne '/') {
+                $pf2.page = [string]$fp.Page
+            }
+            [void](Save-PortalProfile $pf2)
+            Write-Stdout ('  ✓ 识别为 ' + $fp.Vendor + ',已套用预设 ' + $fp.Id)
+            if (@('srun', 'srun2', 'ruijie') -contains $fp.Id) {
+                Write-Stdout '    注意:这个预设是骨架,密码算法可能还要校准(失败就把 collect 包发出来)'
+            }
+            $applied = $true
+        }
+    }
+
+    # ---- 4. 没匹配上就从页面表单生成 ----
+    if (-not $applied) {
+        $pageUrl = ''
+        if ($cap) { $pageUrl = $cap }
+        elseif ($hh -and @($hh.Hosts).Count -gt 0) { $pageUrl = 'http://' + (@($hh.Hosts)[0]) + '/' }
+        elseif ($gw) { $pageUrl = 'http://' + $gw + '/' }
+        else { $pageUrl = 'http://' + $PortalHost + '/' }
+
+        Write-Stdout ('  没匹配到内置预设,试着从页面生成配置: ' + $pageUrl)
+        $id = [guid]::NewGuid().ToString('N')
+        $htmlFn = Join-Path $env:TEMP ('campusnet-wiz-' + $id + '.html')
+        $eff = $pageUrl
+        $code = ''
+        try {
+            $meta = ((& $Curl -sk -L -A $UA --max-time 12 -o $htmlFn -w '%{http_code}|%{url_effective}' $pageUrl 2>$null) -join '').Trim()
+            $mp = $meta -split '\|', 2
+            $code = $mp[0]
+            if ($mp.Count -gt 1 -and $mp[1] -match '^https?://') { $eff = [string]$mp[1] }
+        } catch { }
+        $html = ''
+        if ($code -and $code -ne '000' -and (Test-Path -LiteralPath $htmlFn)) {
+            try { $html = [System.IO.File]::ReadAllText($htmlFn, [System.Text.Encoding]::UTF8) } catch { }
+        }
+        Remove-Item -LiteralPath $htmlFn -Force -ErrorAction SilentlyContinue
+
+        if ($html) {
+            $draft = Get-PortalFormDraft -Html $html -PageUrl $eff
+            if ($draft.Ok) {
+                $host2 = ''
+                $page2 = '/'
+                try { $uu = [uri]$eff; $host2 = [string]$uu.Authority; $page2 = [string]$uu.PathAndQuery } catch { }
+                $prof = [pscustomobject]@{
+                    id           = 'custom'
+                    name         = '自动生成(取自门户表单)'
+                    protocol     = 'template'
+                    host         = $host2
+                    page         = $page2
+                    loginUrl     = $draft.LoginUrl
+                    method       = $draft.Method
+                    contentType  = 'application/x-www-form-urlencoded'
+                    encrypt      = $draft.Encrypt
+                    template     = $draft.Template
+                    successMatch = ''
+                    msgMatch     = ''
+                    note         = $draft.Note
+                }
+                if (Save-PortalProfile $prof) {
+                    Write-Stdout '  ✓ 已生成门户配置(id=custom):'
+                    Write-Stdout ('      ' + $prof.method + ' ' + $prof.loginUrl)
+                    Write-Stdout ('      ' + $prof.template)
+                    Write-Stdout ('      加密猜测: ' + $prof.encrypt + '(成功判定留空,以连通性为准)')
+                    Write-Stdout '    可以先试登录;不行就跑 -Mode portal -DetectPortal 或 -Mode collect'
+                    $applied = $true
+                }
+            } else {
+                Write-Stdout '  页面里没找到「密码框 + 账号框」的表单(可能要先进一个页面才出现)'
+            }
+        } else {
+            Write-Stdout ('  页面也打不开(HTTP ' + $code + ')')
+        }
+    }
+
+    if (-not $applied) {
+        Write-Stdout '  - 门户配置没动。可以:①浏览器开一次认证页,把地址栏发出来;②跑 -Mode collect 发采集包'
+    }
+
+    # ---- 5. 试登录 ----
+    $cred = Get-ActiveCred
+    if ($cred) {
+        $a3 = (Read-Host '  现在试登录一次? [Y/n]').Trim().ToLowerInvariant()
+        if ($a3 -ne 'n') {
+            if (Test-Online) {
+                Write-Stdout '  已经在线,跳过(要强制重登: -Mode login -Force)'
+            } else {
+                $ok = Invoke-LoginOnce -Cred $cred
+                Write-Stdout ('  登录' + $(if ($ok) { '成功 ✓' } else { '失败 —— 看 -Mode log,或跑 -Mode portal -DetectPortal' }))
+            }
+        }
+    }
+
+    # ---- 6. 开机自启 ----
+    if (-not (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)) {
+        $a4 = (Read-Host '  要装开机自启吗? [Y/n]').Trim().ToLowerInvariant()
+        if ($a4 -ne 'n') { [void](Invoke-Install) }
+    }
+
+    Write-Stdout ''
+    Write-Stdout '  向导结束。以后直接开菜单就能用。'
+    Write-Stdout ''
+}
+
 # ================= 诊断 =================
 function Add-DoctorItem {
     param($List, [string]$Name, [string]$Level, [string]$Detail)
@@ -5392,6 +5658,7 @@ function Show-Menu {
         $curProto = [string](Get-PortalProfile).name
         Write-Stdout ('       (当前: ' + $curProto + ')')
         Write-Stdout '  C) 采集诊断包(远程排查用,自动复制到剪贴板)'
+        Write-Stdout '  G) 新手向导(问一句是不是校园网 + 认门户)'
         Write-Stdout '  L) 查看日志'
         Write-Stdout '  0) 退出'
         Write-Stdout '=================================================='
@@ -5477,6 +5744,7 @@ function Show-Menu {
             }
             'L' { Show-Log }
             'C' { Invoke-Collect }
+            'G' { Invoke-Wizard }
             '0' { return }
             default { Write-Stdout '无效选择' }
         }
@@ -5529,6 +5797,7 @@ switch ($Mode) {
     'uninstall' { Invoke-Uninstall }
     'log'       { Show-Log }
     'collect'   { Invoke-Collect; exit 0 }
+    'wizard'    { Invoke-Wizard; exit 0 }
     'synctime'  { [void](Sync-Clock -Always) }
 
     'wifi'      { if (Test-WifiConnected -Ssid $WifiSsid) { exit 0 } else { exit 1 } }
@@ -5663,5 +5932,11 @@ switch ($Mode) {
 
     'tray'  { Invoke-Tray }
 
-    default { Show-Menu }
+    default {
+        # 第一次跑(既没设置也没账号)先走一遍向导:问一句"这个 WiFi 是不是校园网",再认门户
+        if ((-not (Test-Path $SettingsFn)) -and (-not (Test-Path $AccountsFn)) -and (-not (Test-Path $script:PortalFn))) {
+            Invoke-Wizard
+        }
+        Show-Menu
+    }
 }
