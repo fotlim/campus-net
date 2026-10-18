@@ -149,6 +149,7 @@ function Get-Settings {
         iconWander      = $false
         iconEatSec      = 180
         iconReady       = $false
+        petAutoStart    = $true
         memCleanAuto    = $true
         memCleanMinFreePct = 12
         memCleanCooldownMin = 10
@@ -193,6 +194,7 @@ function Get-Settings {
         if (-not $s.PSObject.Properties['iconWander']) { $s | Add-Member -NotePropertyName iconWander -NotePropertyValue $false -Force }
         if (-not $s.PSObject.Properties['iconEatSec']) { $s | Add-Member -NotePropertyName iconEatSec -NotePropertyValue 180 -Force }
         if (-not $s.PSObject.Properties['iconReady']) { $s | Add-Member -NotePropertyName iconReady -NotePropertyValue $false -Force }
+        if (-not $s.PSObject.Properties['petAutoStart']) { $s | Add-Member -NotePropertyName petAutoStart -NotePropertyValue $true -Force }
         if (-not $s.PSObject.Properties['memCleanAuto']) { $s | Add-Member -NotePropertyName memCleanAuto -NotePropertyValue $true -Force }
         if (-not $s.PSObject.Properties['memCleanMinFreePct']) { $s | Add-Member -NotePropertyName memCleanMinFreePct -NotePropertyValue 12 -Force }
         if (-not $s.PSObject.Properties['memCleanCooldownMin']) { $s | Add-Member -NotePropertyName memCleanCooldownMin -NotePropertyValue 10 -Force }
@@ -240,6 +242,7 @@ function Save-Settings {
         iconWander      = [bool]$(if ($null -ne $Settings.iconWander) { $Settings.iconWander } else { $false })
         iconEatSec      = [int]$(if ($Settings.iconEatSec) { $Settings.iconEatSec } else { 180 })
         iconReady       = [bool]$(if ($null -ne $Settings.iconReady) { $Settings.iconReady } else { $false })
+        petAutoStart    = [bool]$(if ($null -ne $Settings.petAutoStart) { $Settings.petAutoStart } else { $true })
         memCleanAuto    = [bool]$(if ($null -ne $Settings.memCleanAuto) { $Settings.memCleanAuto } else { $true })
         memCleanMinFreePct = [int]$(if ($Settings.memCleanMinFreePct) { $Settings.memCleanMinFreePct } else { 12 })
         memCleanCooldownMin = [int]$(if ($Settings.memCleanCooldownMin) { $Settings.memCleanCooldownMin } else { 10 })
@@ -6744,6 +6747,18 @@ function Invoke-Tray {
         })
     [void]$menu.Items.Add($itemPet)
 
+    $itemPetAuto = New-Object System.Windows.Forms.ToolStripMenuItem
+    $itemPetAuto.Text = '启动时自动拉起桌宠'
+    $itemPetAuto.Checked = [bool](Get-Settings).petAutoStart
+    $itemPetAuto.add_Click({
+            $s = Get-Settings
+            $s.petAutoStart = -not [bool]$s.petAutoStart
+            Save-Settings -Settings $s
+            $itemPetAuto.Checked = [bool]$s.petAutoStart
+            Write-Log ('启动时自动拉起桌宠:' + $(if ($s.petAutoStart) { '开' } else { '关' }))
+        })
+    [void]$menu.Items.Add($itemPetAuto)
+
     $itemMenu = New-Object System.Windows.Forms.ToolStripMenuItem
     $itemMenu.Text = '打开设置菜单…'
     $itemMenu.add_Click({
@@ -6801,8 +6816,11 @@ function Invoke-Tray {
     Start-WatcherIfNeeded
     Update-TrayState
 
-    # 宠物跟着托盘一起起来(开关在托盘右键 / 菜单 P)
-    if ((Get-Settings).pet) { [void](Start-Pet) }
+    # 宠物跟着托盘一起起来(开关在托盘右键 / 菜单 P);「启动时自动拉起」关掉就不起
+    $st = Get-Settings
+    if ($st.pet -and $st.petAutoStart) { [void](Start-Pet) }
+    # 首轮 Sync 不重复处理:上面已经按设置定过启停,这里只记录基准
+    try { if (Test-Path $SettingsFn) { $script:PetSettingsStamp = (Get-Item $SettingsFn).LastWriteTimeUtc.Ticks } } catch { }
 
     $timer = New-Object System.Windows.Forms.Timer
     $timer.Interval = 2000

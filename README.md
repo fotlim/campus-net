@@ -718,7 +718,8 @@ rememberPwd=0
 | `Connect-CampusNet.ps1` | 主脚本 |
 | `connect.bat` | 双击入口。**优先用 `wt.exe` 显式启动 Windows Terminal**(见下方"窗口还是老式的?"),没装 WT 才退回普通控制台 |
 | `accounts.json` | 多账号,密码 DPAPI 加密 |
-| `portal.json` | 门户配置(主机、登录接口、参数模板、加密方式、成功判定)。首次运行自动生成,删掉会恢复 Dr.COM 默认 |`r`n| `settings.json` | 设置:`autoWifi`(是否自动连 WiFi)、`wifiSsid`(目标网络)、`lastPortalCheck`(上次自检)、`lastRepair` / `lastNicReset` / `lastResume`(修复节流与唤醒记录,自动维护,不用手改) |
+| `portal.json` | 门户配置(主机、登录接口、参数模板、加密方式、成功判定)。首次运行自动生成,删掉会恢复 Dr.COM 默认 |
+| `settings.json` | 设置:`autoWifi`(是否自动连 WiFi)、`wifiSsid`(目标网络)、`lastPortalCheck`(上次自检)、`lastRepair` / `lastNicReset` / `lastResume`(修复节流与唤醒记录,自动维护,不用手改) |
 | `doctor-report.txt` | 一键诊断生成的报告(也是"问人时该贴什么"的答案) |
 | `portal-check.txt` | 门户改版自检生成的报告,守护每 24 小时自动刷新一次 |
 | `state.json` | 守护写给托盘看的状态(在线/账号/时间/pid) |
@@ -765,6 +766,7 @@ rememberPwd=0
   - 自动清理可选顺带清系统缓存
   - **免 UAC 提权任务** `CampusNet-MemClean`:托盘权限不够时自动改用,不弹 UAC
   - 顺带加命令行入口 `-Mode memclean -Scope light|system|all`
+- **新增开关「启动时自动拉起桌宠」**:托盘右键 →「启动时自动拉起桌宠」勾选;关掉后开机/托盘重启不会再自动弹出桌宠,需要时在「桌面宠物」里手动打开
 
 ### v1.2.2(2026-10-18)
 
