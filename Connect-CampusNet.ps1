@@ -103,7 +103,7 @@ $VbsFile    = Join-Path $WorkDir 'run-hidden.vbs'
 $TaskName   = 'CampusNet-AutoLogin'
 $RepairTaskName = 'CampusNet-Repair'
 $UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-$script:AppVersion = '1.2.2'
+$script:AppVersion = '1.3.0'
 $Curl = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
 $script:NicList = $null
 $script:NicListAt = [datetime]::MinValue
@@ -2833,6 +2833,7 @@ $script:PetMemeCache = @{}
 $script:LayeredCs = @'
 using System;
 using System.Drawing;
+using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
 
 namespace CampusNetPet {
@@ -2885,8 +2886,130 @@ namespace CampusNetPet {
             } catch { return false; }
         }
 
-        public static IntPtr ToHBitmap(Bitmap bmp) { return bmp.GetHbitmap(Color.FromArgb(0)); }
+// ---- 32bpp 顶向下 DIB 段:ULW / AlphaBlend 都要求「预乘 alpha」的 BGRA ----
+        [StructLayout(LayoutKind.Sequential)]
+        struct BITMAPINFOHEADER {
+            public int biSize, biWidth, biHeight;
+            public short biPlanes, biBitCount;
+            public int biCompression, biSizeImage, biXPelsPerMeter, biYPelsPerMeter, biClrUsed, biClrImportant;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        struct BITMAPOBJ { public int bmType, bmWidth, bmHeight, bmWidthBytes; public short bmPlanes, bmBitsPixel; public IntPtr bmBits; }
+
+        [DllImport("gdi32.dll")] static extern IntPtr CreateDIBSection(IntPtr hdc, ref BITMAPINFOHEADER bmi, int usage, out IntPtr bits, IntPtr hSection, int offset);
+        [DllImport("gdi32.dll")] static extern int GetObject(IntPtr h, int size, ref BITMAPOBJ bmp);
+        [DllImport("gdi32.dll")] static extern bool BitBlt(IntPtr dst, int x, int y, int w, int h, IntPtr src, int sx, int sy, int rop);
+        [DllImport("msimg32.dll")] static extern bool AlphaBlend(IntPtr dst, int dx, int dy, int dw, int dh, IntPtr src, int sx, int sy, int sw, int sh, BLENDFUNCTION blend);
+
+        public static IntPtr NewDib(int w, int h, out IntPtr bits) {
+            BITMAPINFOHEADER bmi = new BITMAPINFOHEADER();
+            bmi.biSize = 40; bmi.biWidth = w; bmi.biHeight = -h;   // 负高度 = 顶向下
+            bmi.biPlanes = 1; bmi.biBitCount = 32; bmi.biCompression = 0;
+            IntPtr screenDc = GetDC(IntPtr.Zero);
+            try { return CreateDIBSection(screenDc, ref bmi, 0, out bits, IntPtr.Zero, 0); }
+            finally { ReleaseDC(IntPtr.Zero, screenDc); }
+        }
+
+        public static void GetSize(IntPtr hb, out int w, out int h) {
+            BITMAPOBJ bo = new BITMAPOBJ();
+            GetObject(hb, Marshal.SizeOf(typeof(BITMAPOBJ)), ref bo);
+            w = bo.bmWidth; h = bo.bmHeight;
+        }
+
+        // 位图 → 预乘 alpha 的 DIB(ULW / AlphaBlend 的正确格式)
+        public static IntPtr ToHBitmap(Bitmap bmp) {
+            int w = bmp.Width, h = bmp.Height;
+            var rect = new Rectangle(0, 0, w, h);
+            var data = bmp.LockBits(rect, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+            try {
+                int stride = data.Stride;
+                byte[] src = new byte[stride * h];
+                Marshal.Copy(data.Scan0, src, 0, src.Length);
+                IntPtr bits;
+                IntPtr hb = NewDib(w, h, out bits);
+                byte[] dst = new byte[w * h * 4];
+                for (int y = 0; y < h; y++) {
+                    int srow = y * stride, drow = y * w * 4;
+                    for (int x = 0; x < w; x++) {
+                        int s = srow + x * 4, d = drow + x * 4;
+                        byte a = src[s + 3];
+                        if (a == 0) { dst[d] = dst[d + 1] = dst[d + 2] = dst[d + 3] = 0; }
+                        else if (a == 255) { dst[d] = src[s]; dst[d + 1] = src[s + 1]; dst[d + 2] = src[s + 2]; dst[d + 3] = 255; }
+                        else {
+                            dst[d] = (byte)(src[s] * a / 255);
+                            dst[d + 1] = (byte)(src[s + 1] * a / 255);
+                            dst[d + 2] = (byte)(src[s + 2] * a / 255);
+                            dst[d + 3] = a;
+                        }
+                    }
+                }
+                Marshal.Copy(dst, 0, bits, dst.Length);
+                return hb;
+            } finally { bmp.UnlockBits(data); }
+        }
+
         public static void FreeHBitmap(IntPtr h) { if (h != IntPtr.Zero) DeleteObject(h); }
+
+        // 调试用:读回 DIB 原始像素(BGRA,预乘)
+        public static byte[] ReadDib(IntPtr hb) {
+            BITMAPOBJ bo = new BITMAPOBJ();
+            GetObject(hb, Marshal.SizeOf(typeof(BITMAPOBJ)), ref bo);
+            byte[] b = new byte[bo.bmWidth * bo.bmHeight * 4];
+            Marshal.Copy(bo.bmBits, b, 0, b.Length);
+            return b;
+        }
+
+        // 水平镜像(左右朝向)。预乘数据逐像素搬,镜像不影响预乘关系
+        public static IntPtr Mirror(IntPtr hb, int w, int h) {
+            IntPtr dstBits;
+            IntPtr res = NewDib(w, h, out dstBits);
+            if (res == IntPtr.Zero) return IntPtr.Zero;
+            BITMAPOBJ bo = new BITMAPOBJ();
+            GetObject(hb, Marshal.SizeOf(typeof(BITMAPOBJ)), ref bo);
+            byte[] src = new byte[w * h * 4];
+            Marshal.Copy(bo.bmBits, src, 0, src.Length);
+            byte[] dst = new byte[w * h * 4];
+            for (int y = 0; y < h; y++) {
+                int row = y * w * 4;
+                for (int x = 0; x < w; x++) {
+                    int s = row + x * 4, d = row + (w - 1 - x) * 4;
+                    dst[d] = src[s]; dst[d + 1] = src[s + 1]; dst[d + 2] = src[s + 2]; dst[d + 3] = src[s + 3];
+                }
+            }
+            Marshal.Copy(dst, 0, dstBits, dst.Length);
+            return res;
+        }
+
+        // 双缓冲交叉淡入:out = A*(1-t) + B*t(两者都是预乘数据,AlphaBlend 直接算)
+        public static IntPtr Blend(IntPtr hbA, IntPtr hbB, byte t) {
+            int w, h;
+            GetSize(hbA, out w, out h);
+            IntPtr dstBits;
+            IntPtr res = NewDib(w, h, out dstBits);
+            if (res == IntPtr.Zero) return IntPtr.Zero;
+            IntPtr screenDc = GetDC(IntPtr.Zero);
+            IntPtr dstDc = CreateCompatibleDC(screenDc);
+            IntPtr srcDc = CreateCompatibleDC(screenDc);
+            IntPtr od = SelectObject(dstDc, res);
+            IntPtr os = SelectObject(srcDc, hbA);
+            try {
+                // 先把 A 按 (1-t) 画进空白目标,再把 B 按 t 叠上去:
+                // AlphaBlend 只「往上盖」不会「擦掉」底层,所以 A 必须先按 (1-t) 预乘
+                BLENDFUNCTION bfa = new BLENDFUNCTION();
+                bfa.BlendOp = 0; bfa.BlendFlags = 0; bfa.SourceConstantAlpha = (byte)(255 - t); bfa.AlphaFormat = 1;
+                AlphaBlend(dstDc, 0, 0, w, h, srcDc, 0, 0, w, h, bfa);
+                SelectObject(srcDc, hbB);
+                BLENDFUNCTION bfb = new BLENDFUNCTION();
+                bfb.BlendOp = 0; bfb.BlendFlags = 0; bfb.SourceConstantAlpha = t; bfb.AlphaFormat = 1;
+                AlphaBlend(dstDc, 0, 0, w, h, srcDc, 0, 0, w, h, bfb);        // B 按 t 叠上去
+            } finally {
+                SelectObject(srcDc, os);
+                SelectObject(dstDc, od);
+                DeleteDC(srcDc); DeleteDC(dstDc);
+                ReleaseDC(IntPtr.Zero, screenDc);
+            }
+            return res;
+        }
 
         [ThreadStatic] public static int LastError;
 
@@ -4256,50 +4379,264 @@ function Get-PetActionMs {
     return 0
 }
 
-function Get-PetCurrentAnim {
-    if ($script:PetAction -and (Get-Date) -lt $script:PetActionEnd) { return $script:PetAction }
-    if ($script:PetAction) {
-        try {
-            $spent = ((Get-Date) - $script:PetActionStart).TotalSeconds
-            Write-Log ('宠物动作结束:' + (Get-PetLabel $script:PetAction) + ' 实际 ' + [Math]::Round($spent, 1) + ' 秒')
-        } catch { }
-        $script:PetAction = ''
-        $script:PetActionStart = [datetime]::MinValue
-    }
-    if ($script:PetTarget) { return 'walk' }
+# ============== 动画层(照 dsh-pet 的方案:动画链 + 双缓冲交叉淡入 + Q 弹 + 镜像)==============
+
+$script:ClipMain = $null      # 当前片段 @{ Anim; Entry; Time; Index; Loop }
+$script:ClipPrev = $null      # 淡出中的上一段(冻结在切走时的帧)
+$script:FadeT = 1.0           # 0 → 1 的交叉淡入进度
+$script:FadeMs = 130          # 淡入时长(dsh-pet 是 120~150ms 量级)
+$script:Facing = 1            # 1 朝右 / -1 朝左(镜像)
+$script:SquashActive = $false
+$script:SquashU = 0.0
+$script:SquashDur = 0.22      # 挤压时长(220ms)
+$script:SquashMax = 0.55      # 压到 55%
+$script:SpringVX = 0.0
+$script:SpringVY = 0.0
+$script:DragTarget = $null    # 拖动时指针想去的点(弹簧追它)
+$script:Trail = @()           # 指针轨迹(初速估算用)
+$script:PetLastTickAt = [datetime]::MinValue
+$script:ChainW = @{ idle = 20; walk = 4; sleep = 3 }
+
+# 手感常量(取自 dsh-pet src/shared/physics.ts)
+$script:SPRING_K = 200.0            # 拖拽弹簧刚度
+$script:SPRING_C = 30.0             # 阻尼(ζ≈1.06,过阻尼不 overshoot)
+$script:SQ_SOFT_SPEED = 300.0       # 轻落冲击速度
+$script:SQ_HARD_SPEED = 1500.0      # 重砸冲击速度
+$script:MAX_THROW_SPEED = 3600.0    # 甩出速度软上限
+$script:THROW_DEAD_ZONE = 500.0     # 低于它不抛(原地放下),px/s
+$script:TRAIL_KEEP_MS = 200         # 轨迹保留窗口
+$script:RELEASE_WINDOW_MS = 150     # 初速估算窗口
+$script:PEAK_WEIGHT = 0.5           # 端点均值与峰值的权重
+$script:MAX_STEP_DT = 0.05          # 单步最大 dt,防卡顿后巨帧跳变
+$script:REST_VY = 40.0
+$script:REST_VX = 15.0
+
+function Get-PetClipLen {
+    param($Entry)
+    if (-not $Entry -or [double]$Entry.Fps -le 0) { return 1.0 }
+    return ([double]$Entry.Count / [double]$Entry.Fps)
+}
+
+function Get-PetChainWeight {
+    param([string]$Anim)
+    if ($script:ChainW.ContainsKey($Anim)) { return [int]$script:ChainW[$Anim] }
+    return 1
+}
+
+function Test-PetClipLoop {
+    # 这三段是循环片段,其余动作播一遍就回到链上
+    param([string]$Anim)
+    return ($Anim -in @('idle', 'sleep', 'walk'))
+}
+
+function Select-NextPetClip {
+    # 动画链:当前这段播完,其余按权重抽下一段。
+    # idle 权重最高,所以大部分时间是待机;动作各 1 份,偶尔来一段。
+    $cur = ''
+    if ($script:ClipMain) { $cur = [string]$script:ClipMain.Anim }
     if (Test-PetShouldSleep) { return 'sleep' }
-    return 'idle'
+    $pool = New-Object System.Collections.ArrayList
+    foreach ($a in (Get-PetAnimList)) {
+        $id = [string]$a.id
+        if (-not $id) { continue }
+        if ($id -eq $cur -and $id -ne 'idle') { continue }
+        if ($id -eq 'sleep') { continue }        # 打盹只由「空闲太久」触发
+        if ($id -eq 'walk' -and (Get-Random -Maximum 100) -ge 30) { continue }   # 溜达少一点
+        $w = Get-PetChainWeight $id
+        for ($i = 0; $i -lt $w; $i++) { [void]$pool.Add($id) }
+    }
+    if ($pool.Count -eq 0) { return 'idle' }
+    return [string]$pool[(Get-Random -Maximum $pool.Count)]
 }
 
-function Play-PetAction {
-    param([string]$Id, [int]$HoldSec = 0)
-    $dir = Join-Path $script:PetDir $Id
-    if (-not (Test-Path $dir)) { return }
-    $entry = Get-PetFrames -Anim $Id -Scale (Get-PetCfg).Scale
-    if (-not $entry) { if ($fadeSrc) { try { $fadeSrc.Dispose() } catch { } }; return }
-    $fps = $entry.Fps
-    $meta = Get-PetAnimMeta -Id $Id
-    $ms = Get-PetActionMs -Id $Id
-    $dur = 0.0
-    if ($HoldSec -gt 0) { $dur = [double]$HoldSec }
-    elseif ($ms -gt 0) { $dur = $ms / 1000.0 }
-    else { $dur = ($entry.Count / $fps) }
-    # 素材只有一段,来回播(0→末→0)接缝最自然;pet.json 里写 "pingpong": false 可以关掉
-    # 整段素材(没有 ms)就直着播一遍;只有老素材(短片段 + ms)才循环
-    $pingpong = ($ms -gt 0)
-    if ($meta -and $meta.PSObject.Properties['pingpong']) { $pingpong = [bool]$meta.pingpong }
-    $script:PetAction = $Id
-    $script:PetActionStart = Get-Date
-    $script:PetActionPingPong = $pingpong
-    $script:PetActionDurSec = $dur
-    $script:PetActionEnd = (Get-Date).AddSeconds($dur + 0.15)
-    $script:PetAnim = $Id
+function Start-PetClip {
+    # 切到某个片段:旧片段冻结成 Prev 参与交叉淡入(双缓冲)
+    param([string]$Anim, [switch]$Loop, [switch]$NoFade, [switch]$Restart)
+    if (-not $Anim) { return }
+    $cur = $script:ClipMain
+    if (-not $Restart -and $cur -and [string]$cur.Anim -eq $Anim) { return }
+    $entry = Get-PetFrames -Anim $Anim -Scale (Get-PetCfg).Scale
+    if (-not $entry) { return }
+    if ($cur -and -not $NoFade -and $script:FadeMs -gt 0) {
+        $script:ClipPrev = @{ Anim = [string]$cur.Anim; Entry = $cur.Entry; Index = [int]$cur.Index }
+        $script:FadeT = 0.0
+    } else {
+        $script:ClipPrev = $null
+        $script:FadeT = 1.0
+    }
+    $repeats = 0
+    if ($Loop) { $repeats = 999 }
+    if ($Anim -eq 'idle') { $repeats = (Get-Random -Minimum 0 -Maximum 2) }   # 待机播 1~3 轮(10~30 秒)后进链
+    $script:ClipMain = @{ Anim = $Anim; Entry = $entry; Time = 0.0; Index = 0; Loop = [bool]$Loop; Repeats = $repeats }
+    $script:PetAnim = $Anim
     $script:PetLastIdx = -1
-    if ($script:PetSw) { $script:PetSw.Restart() }
-    $script:PetStillSince = (Get-Date).AddSeconds($dur)
-    Write-Log ('宠物动作:' + (Get-PetLabel $Id) + ' ' + [Math]::Round($dur, 1) + ' 秒' + $(if ($pingpong) { '(往返循环)' } elseif ($ms -gt 0) { '(循环)' } else { '(整段 ' + [Math]::Round($dur, 1) + ' 秒)' }))
 }
 
+function Update-PetAnim {
+    param([double]$Dt)
+    if (-not $script:ClipMain) { Start-PetClip -Anim 'idle' -Loop; return }
+    $c = $script:ClipMain
+    $len = Get-PetClipLen $c.Entry
+    $c.Time += $Dt
+    if ($c.Time -ge $len) {
+        if ($c.Loop -and [int]$c.Repeats -gt 0) { $c.Repeats = [int]$c.Repeats - 1; $c.Time = 0.0; return }
+        if ($c.Loop -and [int]$c.Repeats -ge 900) { $c.Time = $c.Time % $len }
+        else {
+            $spent = $len
+            Write-Log ('宠物动作结束:' + (Get-PetLabel $c.Anim) + ' 实际 ' + [Math]::Round($spent, 1) + ' 秒')
+            $next = Select-NextPetClip
+            $c.Time = 0.0
+            Start-PetClip -Anim $next -Loop:(Test-PetClipLoop $next)
+            return
+        }
+    }
+    $idx = [int][Math]::Floor($c.Time * [double]$c.Entry.Fps)
+    if ($idx -lt 0) { $idx = 0 }
+    if ($idx -ge $c.Entry.Count) { $idx = $c.Entry.Count - 1 }
+    $c.Index = $idx
+    if ($script:FadeT -lt 1.0) {
+        $script:FadeT += ($Dt * 1000.0 / [double]$script:FadeMs)
+        if ($script:FadeT -ge 1.0) { $script:FadeT = 1.0; $script:ClipPrev = $null }
+    }
+}
+
+function Get-PetTickDt {
+    $now = Get-Date
+    $dt = 0.016
+    if ($script:PetLastTickAt -ne [datetime]::MinValue) { $dt = ($now - $script:PetLastTickAt).TotalSeconds }
+    $script:PetLastTickAt = $now
+    if ($dt -le 0) { $dt = 0.016 }
+    if ($dt -gt $script:MAX_STEP_DT) { $dt = $script:MAX_STEP_DT }
+    return $dt
+}
+
+function Get-PetFacingHb {
+    # 取某一帧的位图,需要时返回镜像版(带缓存,按距离淘汰)
+    param($Entry, [int]$Index)
+    $hb = Get-PetFrameHb -Entry $Entry -Index $Index
+    if ($hb -eq [IntPtr]::Zero -or $script:Facing -ge 0) { return $hb }
+    if (-not $Entry.PSObject.Properties['MirHbs']) {
+        $Entry | Add-Member -NotePropertyName MirHbs -NotePropertyValue @{} -Force
+    }
+    if ($Entry.MirHbs.ContainsKey($Index)) { return $Entry.MirHbs[$Index] }
+    $m = [CampusNetPet.Layered]::Mirror($hb, $Entry.W, $Entry.H)
+    if ($m -eq [IntPtr]::Zero) { return $hb }
+    $Entry.MirHbs[$Index] = $m
+    if ($Entry.MirHbs.Count -gt 22) {
+        foreach ($k2 in @($Entry.MirHbs.Keys)) {
+            if ([Math]::Abs([int]$k2 - $Index) -gt 10) {
+                try { [CampusNetPet.Layered]::FreeHBitmap($Entry.MirHbs[$k2]) } catch { }
+                $Entry.MirHbs.Remove($k2)
+            }
+        }
+    }
+    return $m
+}
+
+# ---------------- Q 弹挤压 ----------------
+function New-PetSquash {
+    param([double]$ImpactSpeed = -1, [double]$Amount = -1)
+    $amt = $Amount
+    if ($amt -lt 0) {
+        if ($ImpactSpeed -le 0) { $amt = $script:SquashMax }
+        else {
+            $t2 = ($ImpactSpeed - $script:SQ_SOFT_SPEED) / ($script:SQ_HARD_SPEED - $script:SQ_SOFT_SPEED)
+            if ($t2 -lt 0) { $t2 = 0 } elseif ($t2 -gt 1) { $t2 = 1 }
+            $amt = 0.8 - 0.25 * $t2      # 轻落压到 80%,重砸压到 55%
+        }
+    }
+    if ($amt -lt 0.3) { $amt = 0.3 }
+    if ($amt -gt 0.95) { $amt = 0.95 }
+    $script:SquashMax = $amt
+    $script:SquashU = 0.0
+    $script:SquashActive = $true
+}
+
+function Step-PetSquash {
+    param([double]$Dt)
+    if (-not $script:SquashActive) { return }
+    $script:SquashU += ($Dt / [double]$script:SquashDur)
+    if ($script:SquashU -ge 1.0) { $script:SquashU = 1.0; $script:SquashActive = $false }
+}
+
+function Get-PetSquashScale {
+    if (-not $script:SquashActive) { return @(1.0, 1.0) }
+    $e = [Math]::Sin([Math]::PI * [Math]::Min(1.0, $script:SquashU))
+    $sy = 1.0 - (1.0 - $script:SquashMax) * $e
+    $sx = 1.0 + (1.0 - $sy) * 0.55       # 竖直压扁时横向补偿一点,像挤压
+    return @($sx, $sy)
+}
+
+# ---------------- 拖拽弹簧跟手 ----------------
+function Step-PetSpring {
+    # 过阻尼弹簧:宠物「追」指针,略滞后 —— 这就是 dsh-pet 的跟手感
+    param([double]$Dt)
+    if (-not $script:DragTarget) { return }
+    if ($Dt -le 0) { return }
+    $ax = $script:SPRING_K * ($script:DragTarget.X - $script:PetXf) - $script:SPRING_C * $script:SpringVX
+    $ay = $script:SPRING_K * ($script:DragTarget.Y - $script:PetYf) - $script:SPRING_C * $script:SpringVY
+    $script:SpringVX += $ax * $Dt
+    $script:SpringVY += $ay * $Dt
+    $script:PetXf += $script:SpringVX * $Dt
+    $script:PetYf += $script:SpringVY * $Dt
+}
+
+function Clear-PetDragSpringTrail {
+    $script:Trail = @()
+}
+
+function Clear-PetDragSpring {
+    $script:DragTarget = $null
+    $script:SpringVX = 0.0
+    $script:SpringVY = 0.0
+    $script:Trail = @()
+}
+
+# ---------------- 初速估算(轨迹窗口 + 峰值加权 + 死区 + 软上限)----------------
+function Add-PetTrailPoint {
+    param([double]$X, [double]$Y)
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    $script:Trail += [pscustomobject]@{ T = $now; X = $X; Y = $Y }
+    $cut = $now - $script:TRAIL_KEEP_MS
+    $script:Trail = @($script:Trail | Where-Object { $_.T -ge $cut })
+}
+
+function Get-PetThrowVelocity {
+    # 返回 @(vx, vy) px/s;不够快就返回 @(0,0)(原地放下)
+    $tr = @($script:Trail)
+    if ($tr.Count -lt 2) { return @(0.0, 0.0) }
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    $win = @($tr | Where-Object { $_.T -ge ($now - $script:RELEASE_WINDOW_MS) })
+    if ($win.Count -lt 2) { $win = $tr }
+    $first = $win[0]; $last = $win[$win.Count - 1]
+    $span = [double]($last.T - $first.T) / 1000.0
+    if ($span -le 0.02) { return @(0.0, 0.0) }
+    $avgVx = ($last.X - $first.X) / $span
+    $avgVy = ($last.Y - $first.Y) / $span
+    # 峰值(逐段最大速度),弥补快甩时位移集中在一小段里被低估
+    $peak = 0.0; $peakVx = 0.0; $peakVy = 0.0
+    for ($i = 1; $i -lt $win.Count; $i++) {
+        $dt = [double]($win[$i].T - $win[$i - 1].T) / 1000.0
+        if ($dt -lt 0.008) { continue }
+        $vx = ($win[$i].X - $win[$i - 1].X) / $dt
+        $vy = ($win[$i].Y - $win[$i - 1].Y) / $dt
+        $sp = [Math]::Sqrt($vx * $vx + $vy * $vy)
+        if ($sp -gt $peak) { $peak = $sp; $peakVx = $vx; $peakVy = $vy }
+    }
+    $vx2 = $avgVx * (1 - $script:PEAK_WEIGHT) + $peakVx * $script:PEAK_WEIGHT
+    $vy2 = $avgVy * (1 - $script:PEAK_WEIGHT) + $peakVy * $script:PEAK_WEIGHT
+    $speed = [Math]::Sqrt($vx2 * $vx2 + $vy2 * $vy2)
+    if ($speed -lt $script:THROW_DEAD_ZONE) { return @(0.0, 0.0) }
+    # 软上限:任意力度下单调,渐近不超过上限
+    $cap = $script:MAX_THROW_SPEED
+    $scaled = $cap * (1.0 - [Math]::Exp(-$speed / $cap))
+    $k = $scaled / $speed
+    $outX = $vx2 * $k
+    $outY = $vy2 * $k
+    return @($outX, $outY)
+}
+
+# ---------------- 溜达 ----------------
 function Start-PetWander {
     $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
     $script:ScreenW = $wa.Right; $script:ScreenH = $wa.Bottom
@@ -4307,7 +4644,9 @@ function Start-PetWander {
     $ty = $script:PetYf + (Get-Random -Minimum -140 -Maximum 140)
     $tx = [Math]::Max($wa.Left + 10, [Math]::Min($wa.Right - 190, $tx))
     $ty = [Math]::Max($wa.Top + 10, [Math]::Min($wa.Bottom - 210, $ty))
+    if ([Math]::Abs($tx - $script:PetXf) -gt 6) { $script:Facing = $(if ($tx -gt $script:PetXf) { 1 } else { -1 }) }
     $script:PetTarget = @{ X = [double]$tx; Y = [double]$ty }
+    Start-PetClip -Anim 'walk' -Loop
 }
 
 function Step-PetWander {
@@ -4320,35 +4659,40 @@ function Step-PetWander {
         $script:PetYf = $script:PetTarget.Y
         $script:PetTarget = $null
         $script:PetStillSince = Get-Date
+        Start-PetClip -Anim 'idle' -Loop
         try { [void](Invoke-IconEventNearPet -Source 'wander' -Chance 25) } catch { }
         return
     }
-    # 浮点累加,每秒约 96px;取整只在绘制时做,不会有整数截断造成的抖动
+    # 每秒约 96px;取整只在绘制时做
     $step = 1.6
     $script:PetXf = $script:PetXf + $dx / $d * $step
     $script:PetYf = $script:PetYf + $dy / $d * $step
 }
-
-# ---------------- 物理(拖拽抛掷) ----------------
+# ---------------- 物理(拖拽甩出后的自由运动)----------------
 function Start-PetPhysics {
     param([double]$Vx, [double]$Vy)
     $cfg = Get-PetCfg
     $script:PetVx = $Vx * $cfg.ThrowPower
     $script:PetVy = $Vy * $cfg.ThrowPower
-    # 限制一下,免得一甩就飞出屏幕外找不回来
-    if ([Math]::Abs($script:PetVx) -gt 4000) { $script:PetVx = 4000 * [Math]::Sign($script:PetVx) }
-    if ([Math]::Abs($script:PetVy) -gt 4000) { $script:PetVy = 4000 * [Math]::Sign($script:PetVy) }
     $script:PetTarget = $null
+    Clear-PetDragSpring
     $script:PetPhys = ($script:PetVx -ne 0 -or $script:PetVy -ne 0)
     $script:PetLastPhysAt = Get-Date
-    Write-Log ('宠物被甩出去: vx=' + [int]$script:PetVx + ' vy=' + [int]$script:PetVy)
+    if ($script:PetPhys) {
+        Write-Log ('宠物被甩出去: vx=' + [int]$script:PetVx + ' vy=' + [int]$script:PetVy)
+        # 朝飞行方向
+        if ([Math]::Abs($script:PetVx) -gt 40) { $script:Facing = $(if ($script:PetVx -gt 0) { 1 } else { -1 }) }
+        if ($script:ClipMain -and [string]$script:ClipMain.Anim -in @('idle', 'walk', 'sleep')) {
+            Start-PetClip -Anim 'walk' -Loop
+        }
+    }
 }
 
 function Step-PetPhysics {
     param([double]$Dt)
     if (-not $script:PetPhys) { return }
     if ($Dt -le 0) { $Dt = 0.016 }
-    if ($Dt -gt 0.1) { $Dt = 0.1 }
+    if ($Dt -gt $script:MAX_STEP_DT) { $Dt = $script:MAX_STEP_DT }
 
     $cfg = Get-PetCfg
     $g = [double]$cfg.Gravity
@@ -4364,23 +4708,26 @@ function Step-PetPhysics {
     $pw = $script:PetForm.ClientSize.Width
     $ph = $script:PetForm.ClientSize.Height
     $minX = $wa.Left
-    $maxX = $wa.Right - $pw
+    $maxX = [Math]::Max($minX, $wa.Right - $pw)
     $minY = $wa.Top
-    $maxY = $wa.Bottom - $ph
+    $maxY = [Math]::Max($minY, $wa.Bottom - $ph)
 
     $onGround = $false
     if ($script:PetYf -ge $maxY) {
         $script:PetYf = $maxY
         $onGround = $true
-        if ([Math]::Abs($script:PetVy) -gt 60) { $script:PetVy = -$script:PetVy * $e }
-        else { $script:PetVy = 0 }
-        # 地面摩擦
+        $impact = [Math]::Abs($script:PetVy)
+        if ($impact -gt $script:REST_VY) {
+            # 落地 Q 弹:冲击速度越大压得越狠
+            New-PetSquash -ImpactSpeed $impact
+            $script:PetVy = -$script:PetVy * $e
+        } else { $script:PetVy = 0 }
         $script:PetVx = $script:PetVx * [Math]::Max(0, 1 - $f * $Dt)
-        if ([Math]::Abs($script:PetVx) -lt 8) { $script:PetVx = 0 }
+        if ([Math]::Abs($script:PetVx) -lt $script:REST_VX) { $script:PetVx = 0 }
     }
     if ($cfg.CeilingBounce -and $script:PetYf -le $minY) {
         $script:PetYf = $minY
-        if ([Math]::Abs($script:PetVy) -gt 60) { $script:PetVy = -$script:PetVy * $e } else { $script:PetVy = 0 }
+        if ([Math]::Abs($script:PetVy) -gt $script:REST_VY) { $script:PetVy = -$script:PetVy * $e } else { $script:PetVy = 0 }
     }
     if ($script:PetXf -le $minX) { $script:PetXf = $minX; $script:PetVx = -$script:PetVx * $e }
     if ($script:PetXf -ge $maxX) { $script:PetXf = $maxX; $script:PetVx = -$script:PetVx * $e }
@@ -4388,9 +4735,9 @@ function Step-PetPhysics {
     if ($onGround -and $script:PetVx -eq 0 -and $script:PetVy -eq 0) {
         $script:PetPhys = $false
         $script:PetStillSince = Get-Date
+        if ($script:ClipMain -and [string]$script:ClipMain.Anim -eq 'walk') { Start-PetClip -Anim 'idle' -Loop }
     }
 }
-
 # ---------------- 碎碎念 ----------------
 function Get-PetSayings {
     if ($script:PetSayings) { return $script:PetSayings }
@@ -4420,106 +4767,121 @@ function Show-PetSaying {
 }
 
 # ---------------- 主循环 ----------------
+function Play-PetAction {
+    # 兼容旧调用(菜单/点击都走这里):播一段动作,播完自动接回动画链
+    param([string]$Id, [int]$HoldSec = 0)
+    if (-not $Id) { return }
+    $dir = Join-Path $script:PetDir $Id
+    if (-not (Test-Path $dir)) { return }
+    $entry = Get-PetFrames -Anim $Id -Scale (Get-PetCfg).Scale
+    if (-not $entry) { return }
+    Start-PetClip -Anim $Id -Restart
+    $len = Get-PetClipLen $entry
+    $script:PetStillSince = (Get-Date).AddSeconds($len)
+    Write-Log ('宠物动作:' + (Get-PetLabel $Id) + ' ' + [Math]::Round($len, 1) + ' 秒(整段 ' + [Math]::Round($len, 1) + ' 秒)')
+}
+
 function Update-Pet {
     if (-not $script:PetForm -or $script:PetForm.IsDisposed) { return }
     if (-not $script:PetSw) { return }
     $script:PetTickAll++
     $now = Get-Date
     $cfg = Get-PetCfg
+    $dt = Get-PetTickDt
 
-    # 缩放变了:强制重画一帧(缓存 key 变了,尺寸也会跟着变)
+    # 缩放变了:按新尺寸重建当前片段
     if ([Math]::Abs($cfg.Scale - $script:PetLastScale) -gt 0.001) {
         $script:PetLastScale = $cfg.Scale
-        $script:PetLastIdx = -1
+        $curA = $(if ($script:ClipMain) { [string]$script:ClipMain.Anim } else { 'idle' })
+        Start-PetClip -Anim $curA -Loop:(Test-PetClipLoop $curA) -Restart -NoFade
         $script:PetLastDrawX = -99999
     }
 
-    # 物理(拖拽甩出去之后的自由运动)
-    if ($script:PetPhys) {
-        $dtPhys = $(if ($script:PetLastPhysAt -ne [datetime]::MinValue) { ($now - $script:PetLastPhysAt).TotalSeconds } else { 0.016 })
-        $script:PetLastPhysAt = $now
-        Step-PetPhysics -Dt $dtPhys
-    }
-
-    # 碎碎念气泡到点收掉
-    if ($script:PetSayUntil -ne [datetime]::MinValue -and $now -gt $script:PetSayUntil) {
-        $script:PetSayUntil = [datetime]::MinValue
-        if ($script:PetOverlayKind -eq 'say') { Hide-PetOverlay }
-    }
-
-    # 走动
-    if ($script:PetTarget) { Step-PetWander }
-
-    $anim = Get-PetCurrentAnim
-    if ($anim -ne $script:PetAnim) {
-        $script:PetAnim = $anim
-        $script:PetLastIdx = -1
-        $script:PetSw.Restart()
-    }
-
-    # 帧率变了(菜单切换 / 手改 settings.json)就重建帧缓存;不依赖菜单回调,自己会纠正
+    # 帧率设置变了(菜单切换 / 手改 settings.json)就清帧缓存,自己纠正
     if ([int]$cfg.Fps -ne $script:PetFpsApplied) {
         $script:PetFpsApplied = [int]$cfg.Fps
         foreach ($k in @($script:PetCache.Keys)) {
             foreach ($hb in @($script:PetCache[$k].Hbs.Values)) { [CampusNetPet.Layered]::FreeHBitmap($hb) }
         }
-        $script:PetLastHb = [IntPtr]::Zero
-$script:PetLastAnim = ''
-$script:PetLastFrameIdx = 0
         $script:PetCache = @{}
+        $script:PetLastHb = [IntPtr]::Zero
+        $script:PetLastAnim = ''
+        $script:PetLastFrameIdx = 0
         $script:PetLastIdx = -1
-        # 位图刚释放,催一下 GC,免得托管包装攒着(重建两次能涨几十 MB)
+        $script:PetLastDrawX = -99999
         [GC]::Collect()
         Write-Log ('宠物帧率:' + $script:PetFpsApplied + 'Hz(已重建帧缓存)')
     }
 
-    $entry = Get-PetFrames -Anim $anim -Scale $cfg.Scale
-    if (-not $entry) { return }
-    $fps = $entry.Fps
-    $idx = [int]([Math]::Floor($script:PetSw.Elapsed.TotalSeconds * $fps))
-    if ($script:PetAction) {
-        # 动作要循环撑满整段时长:往返播(0→末→0),接缝处不会硬跳
-        $total = [int]$entry.Count
-        if ($total -le 1) {
-            $idx = 0
-        } elseif ($script:PetActionPingPong) {
-            $cycle = ($total * 2) - 2
-            $i2 = $idx % $cycle
-            if ($i2 -ge $total) { $i2 = $cycle - $i2 }
-            $idx = [Math]::Min($i2, $total - 1)
-        } else {
-            $idx = $idx % $total
-        }
-    } else {
-        $idx = $idx % $entry.Count
+    # 拖动弹簧 / 甩出后的物理 / 溜达
+    if ($script:DragTarget) { Step-PetSpring -Dt $dt }
+    if ($script:PetPhys) { Step-PetPhysics -Dt $dt }
+    if ($script:PetTarget) { Step-PetWander }
+
+    # 气泡到点收掉
+    if ($script:PetSayUntil -ne [datetime]::MinValue -and $now -gt $script:PetSayUntil) {
+        $script:PetSayUntil = [datetime]::MinValue
+        if ($script:PetOverlayKind -eq 'say') { Hide-PetOverlay }
     }
 
+    # 动画链推进 + Q 弹
+    Update-PetAnim -Dt $dt
+    Step-PetSquash -Dt $dt
+
+    $c = $script:ClipMain
+    if (-not $c) { return }
+    $entry = $c.Entry
+    $idx = [int]$c.Index
+    $script:InAction = ([string]$c.Anim -notin @('idle', 'sleep', 'walk'))
+
+    # 双缓冲交叉淡入:上一段的冻结帧 → 当前帧
+    $drawHb = Get-PetFacingHb -Entry $entry -Index $idx
+    if ($drawHb -eq [IntPtr]::Zero) { return }
+    $ownHb = $false
+    if ($script:ClipPrev -and $script:FadeT -lt 1.0) {
+        $hbPrev = Get-PetFacingHb -Entry $script:ClipPrev.Entry -Index ([int]$script:ClipPrev.Index)
+        if ($hbPrev -ne [IntPtr]::Zero) {
+            $b = [CampusNetPet.Layered]::Blend($hbPrev, $drawHb, [byte]([Math]::Round(255 * $script:FadeT)))
+            if ($b -ne [IntPtr]::Zero) { $drawHb = $b; $ownHb = $true }
+        }
+    }
+
+    # Q 弹:竖直压扁、脚底不动(ULW 会把位图拉伸到给定尺寸,不用额外位图)
+    $sq = Get-PetSquashScale
+    $sx = [double]$sq[0]
+    $sy = [double]$sq[1]
+    $dw = [Math]::Max(1, [int][Math]::Round($entry.W * $sx))
+    $dh = [Math]::Max(1, [int][Math]::Round($entry.H * $sy))
     $px = [int][Math]::Round($script:PetXf)
     $py = [int][Math]::Round($script:PetYf)
-    $moved = ($px -ne $script:PetLastDrawX -or $py -ne $script:PetLastDrawY)
+    $dx = $px + [int][Math]::Round(($entry.W - $dw) / 2.0)
+    $dy = $py + ($entry.H - $dh)
+    $moved = ($dx -ne $script:PetLastDrawX -or $dy -ne $script:PetLastDrawY -or $dw -ne $script:PetLastDrawW -or $dh -ne $script:PetLastDrawH)
 
-    # 位置变化也要重画:否则移动只能按动画帧率跳,看着就是"卡顿"
-    # 弹跳/拖动这种高速移动时每帧都重画,别让位置更新跳过绘制
-    if ($idx -ne $script:PetLastIdx -or $moved -or $script:PetPhys -or $script:PetDrag) {
+    if ($idx -ne $script:PetLastIdx -or $moved -or $script:PetPhys -or $script:DragTarget -or $script:SquashActive -or ($script:FadeT -lt 1.0)) {
         $script:PetLastIdx = $idx
         if ($script:PetForm.ClientSize.Width -ne $entry.W -or $script:PetForm.ClientSize.Height -ne $entry.H) {
             $script:PetForm.ClientSize = New-Object System.Drawing.Size -ArgumentList $entry.W, $entry.H
         }
-        $hbNow = Get-PetFrameHb -Entry $entry -Index $idx
-        if ($hbNow -eq [IntPtr]::Zero) { return }
-        $null = [CampusNetPet.Layered]::Draw($script:PetForm.Handle, $hbNow, $entry.W, $entry.H, $px, $py, [byte]255)
-        if (($script:PetPhys -or $script:PetDrag) -and $script:PetOverlay -and $script:PetOverlay.Visible) { try { Hide-PetOverlay } catch { } }
+        try {
+            $null = [CampusNetPet.Layered]::Draw($script:PetForm.Handle, $drawHb, $dw, $dh, $dx, $dy, [byte]255)
+        } finally {
+            if ($ownHb) { try { [CampusNetPet.Layered]::FreeHBitmap($drawHb) } catch { } }
+        }
+        if (($script:PetPhys -or $script:DragTarget) -and $script:PetOverlay -and $script:PetOverlay.Visible) { try { Hide-PetOverlay } catch { } }
         $script:PetX = $px
         $script:PetY = $py
-        $script:PetLastDrawX = $px
-        $script:PetLastDrawY = $py
+        $script:PetLastDrawX = $dx
+        $script:PetLastDrawY = $dy
+        $script:PetLastDrawW = $dw
+        $script:PetLastDrawH = $dh
         $script:PetTicks++
     }
 
     # 面板跟着宠物走 / 内容刷新
     if ($script:PetOverlay -and $script:PetOverlay.Visible) { Update-PetOverlayPosition }
 
-    if ($script:PetHover -and -not $script:PetAction) {
+    if ($script:PetHover -and -not $script:InAction) {
         if (($now - $script:PetOverlayRefreshAt).TotalMilliseconds -ge 500) {
             $script:PetOverlayRefreshAt = $now
             Set-PetOverlayContent -Kind 'info'
@@ -4541,35 +4903,31 @@ $script:PetLastFrameIdx = 0
     }
 
     # 随机走动
-    if (-not $script:PetTarget -and -not $script:PetAction) {
+    if (-not $script:PetTarget -and -not $script:InAction) {
         $wanderOn = [bool]$cfg.Wander
         if ($wanderOn -and $script:PetStillSince -ne [datetime]::MinValue -and ($now - $script:PetStillSince).TotalSeconds -ge 45) {
             Start-PetWander
         }
     }
 
-    # 随机自动碎碎念(和「随机动作间隔」分开:这个是随机时长随机触发)
+    # 随机自动碎碎念
     $sayEvery = [int]$cfg.SayEvery
-    if ($cfg.Say -and $sayEvery -gt 0 -and -not $script:PetAction -and -not $script:PetTarget -and $now -gt $script:PetNextSay) {
+    if ($cfg.Say -and $sayEvery -gt 0 -and -not $script:InAction -and -not $script:PetTarget -and $now -gt $script:PetNextSay) {
         $lo = [Math]::Max(1, [int]($sayEvery * 0.5))
         $hi = [Math]::Max($lo + 1, [int]($sayEvery * 1.5))
         $script:PetNextSay = $now.AddMinutes((Get-Random -Minimum $lo -Maximum ($hi + 1)))
         if (-not ($script:PetOverlay -and $script:PetOverlay.Visible)) { Show-PetSaying }
     }
 
-    # 随机动作 / 表情包
+    # 随机表情包(动作由动画链负责,这里只管表情包)
     $randMin = [int]$cfg.RandomMin
-    if ($randMin -gt 0 -and $now -gt $script:PetNextRandom -and -not $script:PetAction -and -not $script:PetTarget) {
+    if ($randMin -gt 0 -and $now -gt $script:PetNextRandom -and -not $script:InAction -and -not $script:PetTarget) {
         $script:PetNextRandom = $now.AddMinutes($randMin)
-        $pool = @(Get-PetAnimList | Where-Object { $_.id -ne 'idle' -and $_.id -ne 'sleep' -and $_.id -ne 'walk' })
         $memes = @(Get-PetMemeList)
-        $roll = Get-Random -Minimum 0 -Maximum 100
-        if ($memes.Count -gt 0 -and $roll -lt 30) {
+        if ($memes.Count -gt 0) {
             Show-PetMeme -Id ([string]$memes[(Get-Random -Maximum $memes.Count)].id)
-        } elseif ([bool]$cfg.Say -and $roll -lt 55) {
+        } elseif ([bool]$cfg.Say) {
             Show-PetSaying
-        } elseif ($pool.Count -gt 0) {
-            Play-PetAction -Id ([string]$pool[(Get-Random -Maximum $pool.Count)].id)
         }
     }
 
@@ -4580,15 +4938,14 @@ $script:PetLastFrameIdx = 0
             $script:PetFpsLog = $true
             $script:PetTicksWarm = $script:PetTicks
             $script:PetWarmAt = $now
-            Write-Log ('宠物渲染实测 ' + [Math]::Round($script:PetTicks / $el, 1) + ' fps / 计时器 ' + [Math]::Round($script:PetTickAll / $el, 1) + ' Hz(目标 ' + $fps + ')')
+            Write-Log ('宠物渲染实测 ' + [Math]::Round($script:PetTicks / $el, 1) + ' fps / 计时器 ' + [Math]::Round($script:PetTickAll / $el, 1) + ' Hz(目标 ' + [Math]::Round([double]$entry.Fps, 0) + ')')
         } elseif ($script:PetFpsLog -and -not $script:PetFpsLog2 -and $script:PetWarmAt -ne [datetime]::MinValue -and ($now - $script:PetWarmAt).TotalSeconds -ge 10) {
             $script:PetFpsLog2 = $true
             $el2 = ($now - $script:PetWarmAt).TotalSeconds
-            Write-Log ('宠物渲染稳态 ' + [Math]::Round(($script:PetTicks - $script:PetTicksWarm) / $el2, 1) + ' fps(目标 ' + $fps + ')')
+            Write-Log ('宠物渲染稳态 ' + [Math]::Round(($script:PetTicks - $script:PetTicksWarm) / $el2, 1) + ' fps(目标 ' + [Math]::Round([double]$entry.Fps, 0) + ')')
         }
     }
 }
-
 function Save-PetPos {
     try {
         $s = Get-Settings
@@ -5770,32 +6127,24 @@ function Start-Pet {
     $form.add_MouseDown({
             param($s, $e)
             if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
-                $script:PetDrag = @{ X = $e.X; Y = $e.Y; Moved = $false; VX = 0.0; VY = 0.0; At = (Get-Date); LastX = $script:PetXf; LastY = $script:PetYf }
+                $p0 = [System.Windows.Forms.Cursor]::Position
+                $script:PetDrag = @{ OX = ($p0.X - $script:PetXf); OY = ($p0.Y - $script:PetYf); Moved = $false; At = (Get-Date) }
                 $script:PetTarget = $null
                 $script:PetPhys = $false
                 $script:PetVx = 0; $script:PetVy = 0
+                $script:SpringVX = 0.0; $script:SpringVY = 0.0
+                $script:DragTarget = @{ X = $script:PetXf; Y = $script:PetYf }
+                Clear-PetDragSpringTrail
+                Add-PetTrailPoint -X $p0.X -Y $p0.Y
             }
         })
     $form.add_MouseMove({
             param($s, $e)
             if ($script:PetDrag) {
                 $p = [System.Windows.Forms.Cursor]::Position
-                $nx = [double]($p.X - $script:PetDrag.X)
-                $ny = [double]($p.Y - $script:PetDrag.Y)
-                $now = Get-Date
-                $dt = ($now - $script:PetDrag.At).TotalSeconds
-                if ($dt -gt 0.008) {
-                    # 记录拖动速度(px/s),松手时当抛掷初速
-                    $script:PetDrag.VX = ($nx - $script:PetDrag.LastX) / $dt
-                    $script:PetDrag.VY = ($ny - $script:PetDrag.LastY) / $dt
-                    $script:PetDrag.LastX = $nx
-                    $script:PetDrag.LastY = $ny
-                    $script:PetDrag.At = $now
-                }
-                $script:PetXf = $nx
-                $script:PetYf = $ny
-                $script:PetX = [int][Math]::Round($script:PetXf)
-                $script:PetY = [int][Math]::Round($script:PetYf)
+                # 目标点 = 指针位置(保持按下时的相对偏移),宠物由弹簧追过去 → 略滞后,就是跟手感
+                $script:DragTarget = @{ X = [double]($p.X - $script:PetDrag.OX); Y = [double]($p.Y - $script:PetDrag.OY) }
+                Add-PetTrailPoint -X $p.X -Y $p.Y
                 $script:PetDrag.Moved = $true
                 Update-Pet
             }
@@ -5805,9 +6154,16 @@ function Start-Pet {
             if ($script:PetDrag) {
                 if ($script:PetDrag.Moved) {
                     Save-PetPos
-                    # 甩出去:按松手瞬间的速度给一个初速,之后交给重力
-                    $speed = [Math]::Sqrt($script:PetDrag.VX * $script:PetDrag.VX + $script:PetDrag.VY * $script:PetDrag.VY)
-                    if ($speed -gt 120) { Start-PetPhysics -Vx $script:PetDrag.VX -Vy $script:PetDrag.VY }
+                    # 甩出去:轨迹窗口估初速(峰值加权 + 死区 + 软上限),之后交给重力
+                    $v = Get-PetThrowVelocity
+                    $script:DragTarget = $null
+                    if ([Math]::Abs($v[0]) -gt 0 -or [Math]::Abs($v[1]) -gt 0) {
+                        Start-PetPhysics -Vx $v[0] -Vy $v[1]
+                    } else {
+                        # 温柔放下:原地停住,轻轻 Q 弹一下
+                        Clear-PetDragSpring
+                        New-PetSquash -Amount 0.88
+                    }
                     try { [void](Invoke-IconEventNearPet -Source 'drop' -Chance 45) } catch { }
                 }
                 else {
@@ -5817,6 +6173,7 @@ function Start-Pet {
                     $pick = 'wave'
                     if ($pool.Count -gt 0) { $pick = [string]$pool[(Get-Random -Maximum $pool.Count)].id }
                     Play-PetAction -Id $pick
+                    New-PetSquash -Amount 0.72
                     Write-Log ('宠物被' + $(if ($head) { '摸头' } else { '点了一下' }) + ' → ' + (Get-PetLabel $pick))
                     if ([bool](Get-PetCfg).Say -and (Get-Random -Maximum 100) -lt 30) { Show-PetSaying }
                 }
@@ -5827,6 +6184,16 @@ function Start-Pet {
     $script:PetForm = $form
     $script:PetAnim = ''
     $script:PetLastIdx = -1
+    $script:PetLastDrawW = -1
+    $script:PetLastDrawH = -1
+    $script:ClipMain = $null
+    $script:ClipPrev = $null
+    $script:FadeT = 1.0
+    $script:SquashActive = $false
+    $script:DragTarget = $null
+    $script:Trail = @()
+    $script:PetLastTickAt = [datetime]::MinValue
+    Start-PetClip -Anim 'idle' -Loop -NoFade
     $script:PetAction = ''
     $script:PetTarget = $null
     $script:PetStillSince = Get-Date
