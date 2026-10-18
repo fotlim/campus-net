@@ -103,7 +103,7 @@ $VbsFile    = Join-Path $WorkDir 'run-hidden.vbs'
 $TaskName   = 'CampusNet-AutoLogin'
 $RepairTaskName = 'CampusNet-Repair'
 $UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-$script:AppVersion = '1.2.7'
+$script:AppVersion = '1.2.8'
 $Curl = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
 $script:NicList = $null
 $script:NicListAt = [datetime]::MinValue
@@ -2737,7 +2737,7 @@ $script:PetForm   = $null
 $script:PetTimer  = $null
 $script:PetSw     = $null
 $script:PetAnim   = ''
-# 切换动画时的交叉淡入(过渡用):PetFadeFromBmp 是「上一帧」的位图,前 6 帧按比例混过去
+# 切换动画时的交叉淡入(过渡用):PetFadeFromBmp 是「上一帧」的位图,前几帧按比例混过去
 $script:PetFadeFromBmp = $null
 $script:PetFadeLeft = 0
 $script:PetFadeTotal = 0
@@ -4299,9 +4299,9 @@ function Play-PetAction {
     if ($fadeSrc) {
         if ($script:PetFadeFromBmp) { try { $script:PetFadeFromBmp.Dispose() } catch { } }
         $script:PetFadeFromBmp = $fadeSrc
-        $script:PetFadeTotal = 6
-        $script:PetFadeLeft = 6
-        Write-Log ('动作过渡:' + $Id + ' 交叉淡入 6 帧(250ms)')
+        $script:PetFadeTotal = 3
+        $script:PetFadeLeft = 3
+        Write-Log ('动作过渡:' + $Id + ' 交叉淡入 3 帧(125ms)')
     }
     $script:PetAction = $Id
     $script:PetActionStart = Get-Date
@@ -4467,14 +4467,14 @@ function Update-Pet {
 
     $anim = Get-PetCurrentAnim
     if ($anim -ne $script:PetAnim) {
-        # 从 idle 切到动作时交叉淡入 ~250ms(6 帧),别「啪」一下换姿势
+        # 从 idle 切到动作时快速淡入(3 帧 ≈ 125ms):够柔,又不会让两副姿势叠着看
         if ($script:PetLastHb -ne [IntPtr]::Zero) {
             try {
                 if ($script:PetFadeFromBmp) { $script:PetFadeFromBmp.Dispose() }
                 $script:PetFadeFromBmp = Get-PetFrameBitmap -Anim $script:PetLastAnim -Index $script:PetLastFrameIdx
-                $script:PetFadeTotal = 6
-                $script:PetFadeLeft = 6
-                Write-Log ('动作过渡:' + $anim + ' 交叉淡入 6 帧')
+                $script:PetFadeTotal = 3
+                $script:PetFadeLeft = 3
+                Write-Log ('动作过渡:' + $anim + ' 交叉淡入 3 帧')
             } catch { $script:PetFadeFromBmp = $null; $script:PetLastHb = [IntPtr]::Zero
 $script:PetLastAnim = ''
 $script:PetLastFrameIdx = 0 }
@@ -4536,7 +4536,7 @@ $script:PetLastFrameIdx = 0
         if ($script:PetFadeLeft -gt 0 -and $script:PetFadeFromBmp) {
             # 过渡期:把「上一帧」和当前帧按比例混出来再贴
             try {
-                $fa = 1.0 - ($script:PetFadeLeft / [double]$script:PetFadeTotal)
+                $fa = 0.4 + 0.6 * (1.0 - ($script:PetFadeLeft / [double]$script:PetFadeTotal))
                 # 新帧也要用「重解出来的透明位图」,HBITMAP 转出来的会丢 alpha(混出来就是一团黑底)
                 $fb = Get-PetFrameBitmap -Anim $anim -Index $idx
                 $fm = 
