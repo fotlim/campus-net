@@ -25,4 +25,3 @@ fake-portal.log
 # collect bundles (portal html + js) - local only
 collect-*
 
-push.json
