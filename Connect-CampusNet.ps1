@@ -103,7 +103,7 @@ $VbsFile    = Join-Path $WorkDir 'run-hidden.vbs'
 $TaskName   = 'CampusNet-AutoLogin'
 $RepairTaskName = 'CampusNet-Repair'
 $UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-$script:AppVersion = '1.2.5'
+$script:AppVersion = '1.2.6'
 $Curl = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
 $script:NicList = $null
 $script:NicListAt = [datetime]::MinValue
@@ -2737,6 +2737,12 @@ $script:PetForm   = $null
 $script:PetTimer  = $null
 $script:PetSw     = $null
 $script:PetAnim   = ''
+# 切换动画时的交叉淡入(过渡用):PetFadeFromBmp 是「上一帧」的位图,前 6 帧按比例混过去
+$script:PetFadeFromBmp = $null
+$script:PetFadeLeft = 0
+$script:PetFadeTotal = 0
+$script:PetLastHb = [IntPtr]::Zero
+$script:PetBuilding = $null
 $script:PetLastIdx = -1
 $script:PetAction = ''
 $script:PetActionEnd = [datetime]::MinValue
@@ -3167,6 +3173,7 @@ function Get-PetFrames {
     if ($Scale -gt 2.0) { $Scale = 2.0 }
     $key = ('{0}@{1:N2}@{2}@{3}' -f $Anim, $Scale, $script:PetModelId, $script:PetVariantId)
     if ($script:PetCache.ContainsKey($key)) { return $script:PetCache[$key] }
+    if ($script:PetBuilding -eq $key) { return $null }   # 建帧时会跑 DoEvents,消息循环可能转回来要同一套帧
 
     $dir = Join-Path $script:PetDir $Anim
     if (-not (Test-Path $dir)) { return $null }
@@ -3214,6 +3221,9 @@ function Get-PetFrames {
     }
 
     $prev = $null
+    $script:PetBuilding = $key
+    $built = 0
+    try {
     foreach ($f in $files) {
         $bmp = $null
         try {
@@ -3265,11 +3275,14 @@ function Get-PetFrames {
 
             if ($prev) { $prev.Dispose() }
             $prev = $bmp
+            $built++
+            if (($built % 8) -eq 0) { try { [System.Windows.Forms.Application]::DoEvents() } catch { } }
         } catch {
             if ($bmp) { try { $bmp.Dispose() } catch { } }
         }
     }
     if ($prev) { try { $prev.Dispose() } catch { } }
+    } finally { $script:PetBuilding = $null }
     if ($hbs.Count -eq 0) { return $null }
 
     $entry = [pscustomobject]@{ Hbs = $hbs; W = $w; H = $h; Count = $hbs.Count; Fps = ($fps * $k) }
@@ -3281,6 +3294,7 @@ function Get-PetFrames {
             foreach ($hb in $script:PetCache[$k].Hbs) { [CampusNetPet.Layered]::FreeHBitmap($hb) }
             $script:PetCache.Remove($k)
         }
+        $script:PetLastHb = [IntPtr]::Zero
     }
     return $entry
 }
@@ -4205,8 +4219,13 @@ function Play-PetAction {
     param([string]$Id, [int]$HoldSec = 0)
     $dir = Join-Path $script:PetDir $Id
     if (-not (Test-Path $dir)) { return }
+    # 先把「当前这一帧」拷一份当淡入起点:建帧时会把旧缓存释放掉,句柄会失效
+    $fadeSrc = $null
+    if ($script:PetLastHb -ne [IntPtr]::Zero) {
+        try { $fadeSrc = [System.Drawing.Image]::FromHbitmap($script:PetLastHb) } catch { $fadeSrc = $null }
+    }
     $entry = Get-PetFrames -Anim $Id -Scale (Get-PetCfg).Scale
-    if (-not $entry) { return }
+    if (-not $entry) { if ($fadeSrc) { try { $fadeSrc.Dispose() } catch { } }; return }
     $fps = $entry.Fps
     $meta = Get-PetAnimMeta -Id $Id
     $ms = Get-PetActionMs -Id $Id
@@ -4218,6 +4237,14 @@ function Play-PetAction {
     # 整段素材(没有 ms)就直着播一遍;只有老素材(短片段 + ms)才循环
     $pingpong = ($ms -gt 0)
     if ($meta -and $meta.PSObject.Properties['pingpong']) { $pingpong = [bool]$meta.pingpong }
+    # 交叉淡入到动作第一帧(用建帧前拷下来的那份,免得句柄已被释放)
+    if ($fadeSrc) {
+        if ($script:PetFadeFromBmp) { try { $script:PetFadeFromBmp.Dispose() } catch { } }
+        $script:PetFadeFromBmp = $fadeSrc
+        $script:PetFadeTotal = 6
+        $script:PetFadeLeft = 6
+        Write-Log ('动作过渡:' + $Id + ' 交叉淡入 6 帧(250ms)')
+    }
     $script:PetAction = $Id
     $script:PetActionStart = Get-Date
     $script:PetActionPingPong = $pingpong
@@ -4382,6 +4409,16 @@ function Update-Pet {
 
     $anim = Get-PetCurrentAnim
     if ($anim -ne $script:PetAnim) {
+        # 从 idle 切到动作时交叉淡入 ~250ms(6 帧),别「啪」一下换姿势
+        if ($script:PetLastHb -ne [IntPtr]::Zero) {
+            try {
+                if ($script:PetFadeFromBmp) { $script:PetFadeFromBmp.Dispose() }
+                $script:PetFadeFromBmp = [System.Drawing.Image]::FromHbitmap($script:PetLastHb)
+                $script:PetFadeTotal = 6
+                $script:PetFadeLeft = 6
+                Write-Log ('动作过渡:' + $anim + ' 交叉淡入 6 帧')
+            } catch { $script:PetFadeFromBmp = $null; $script:PetLastHb = [IntPtr]::Zero }
+        }
         $script:PetAnim = $anim
         $script:PetLastIdx = -1
         $script:PetSw.Restart()
@@ -4393,6 +4430,7 @@ function Update-Pet {
         foreach ($k in @($script:PetCache.Keys)) {
             foreach ($hb in $script:PetCache[$k].Hbs) { [CampusNetPet.Layered]::FreeHBitmap($hb) }
         }
+        $script:PetLastHb = [IntPtr]::Zero
         $script:PetCache = @{}
         $script:PetLastIdx = -1
         # 位图刚释放,催一下 GC,免得托管包装攒着(重建两次能涨几十 MB)
@@ -4431,7 +4469,30 @@ function Update-Pet {
         if ($script:PetForm.ClientSize.Width -ne $entry.W -or $script:PetForm.ClientSize.Height -ne $entry.H) {
             $script:PetForm.ClientSize = New-Object System.Drawing.Size -ArgumentList $entry.W, $entry.H
         }
-        $null = [CampusNetPet.Layered]::Draw($script:PetForm.Handle, $entry.Hbs[$idx], $entry.W, $entry.H, $px, $py, [byte]255)
+        $hbNow = $entry.Hbs[$idx]
+        $ownHb = $false
+        if ($script:PetFadeLeft -gt 0 -and $script:PetFadeFromBmp) {
+            # 过渡期:把「上一帧」和当前帧按比例混出来再贴
+            try {
+                $fa = 1.0 - ($script:PetFadeLeft / [double]$script:PetFadeTotal)
+                $fb = [System.Drawing.Image]::FromHbitmap($hbNow)
+                $fm = Merge-PetBitmap -A $script:PetFadeFromBmp -B $fb -Alpha $fa
+                $fb.Dispose()
+                if ($fm) {
+                    $hbNow = [CampusNetPet.Layered]::ToHBitmap($fm)
+                    $fm.Dispose()
+                    $ownHb = $true
+                }
+            } catch { }
+            $script:PetFadeLeft--
+            if ($script:PetFadeLeft -le 0) {
+                try { $script:PetFadeFromBmp.Dispose() } catch { }
+                $script:PetFadeFromBmp = $null
+            }
+        }
+        $script:PetLastHb = $entry.Hbs[$idx]
+        $null = [CampusNetPet.Layered]::Draw($script:PetForm.Handle, $hbNow, $entry.W, $entry.H, $px, $py, [byte]255)
+        if ($ownHb) { try { [CampusNetPet.Layered]::FreeHBitmap($hbNow) } catch { } }
         $script:PetX = $px
         $script:PetY = $py
         $script:PetLastDrawX = $px
