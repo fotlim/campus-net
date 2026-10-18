@@ -32,7 +32,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('menu', 'setup', 'switch', 'delete', 'list', 'login', 'status', 'watch', 'tray', 'install', 'uninstall', 'synctime', 'wifi', 'doctor', 'check', 'background', 'log', 'repair', 'notify', 'nicreset', 'pet', 'weather', 'portal', 'collect', 'wizard')]
+    [ValidateSet('menu', 'setup', 'switch', 'delete', 'list', 'login', 'status', 'watch', 'tray', 'install', 'uninstall', 'synctime', 'wifi', 'doctor', 'check', 'background', 'log', 'repair', 'notify', 'nicreset', 'pet', 'weather', 'portal', 'collect', 'wizard', 'push')]
     [string]$Mode = 'menu',
 
     [string]$User,
@@ -103,7 +103,7 @@ $VbsFile    = Join-Path $WorkDir 'run-hidden.vbs'
 $TaskName   = 'CampusNet-AutoLogin'
 $RepairTaskName = 'CampusNet-Repair'
 $UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-$script:AppVersion = '1.1.4'
+$script:AppVersion = '1.1.5'
 $Curl = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
 $script:NicList = $null
 $script:NicListAt = [datetime]::MinValue
@@ -132,6 +132,8 @@ function Get-Settings {
         petSay          = $true
         petWeatherCity  = ''
         caiyunToken     = ''
+        petOverlayW     = 0
+        petOverlayH     = 0
         petOverlayFont  = 9.5
         petOverlayOpacity = 0.94
     }
@@ -159,6 +161,8 @@ function Get-Settings {
         if (-not $s.PSObject.Properties['petSay']) { $s | Add-Member -NotePropertyName petSay -NotePropertyValue $true -Force }
         if (-not $s.PSObject.Properties['petWeatherCity']) { $s | Add-Member -NotePropertyName petWeatherCity -NotePropertyValue '' -Force }
         if (-not $s.PSObject.Properties['caiyunToken']) { $s | Add-Member -NotePropertyName caiyunToken -NotePropertyValue '' -Force }
+        if (-not $s.PSObject.Properties['petOverlayW']) { $s | Add-Member -NotePropertyName petOverlayW -NotePropertyValue 0 -Force }
+        if (-not $s.PSObject.Properties['petOverlayH']) { $s | Add-Member -NotePropertyName petOverlayH -NotePropertyValue 0 -Force }
         if (-not $s.PSObject.Properties['petOverlayFont'] -or [double]$s.petOverlayFont -le 0) { $s | Add-Member -NotePropertyName petOverlayFont -NotePropertyValue 9.5 -Force }
         if (-not $s.PSObject.Properties['petOverlayOpacity'] -or [double]$s.petOverlayOpacity -le 0) { $s | Add-Member -NotePropertyName petOverlayOpacity -NotePropertyValue 0.94 -Force }
         return $s
@@ -189,6 +193,8 @@ function Save-Settings {
         petSay          = [bool]$Settings.petSay
         petWeatherCity  = [string]$Settings.petWeatherCity
         caiyunToken     = [string]$Settings.caiyunToken
+        petOverlayW     = [int]$(if ($Settings.petOverlayW) { $Settings.petOverlayW } else { 0 })
+        petOverlayH     = [int]$(if ($Settings.petOverlayH) { $Settings.petOverlayH } else { 0 })
         petOverlayFont  = [double]$(if ($Settings.petOverlayFont) { $Settings.petOverlayFont } else { 9.5 })
         petOverlayOpacity = [double]$(if ($Settings.petOverlayOpacity) { $Settings.petOverlayOpacity } else { 0.94 })
     } | ConvertTo-Json | Set-Content -Path $SettingsFn -Encoding UTF8
@@ -2508,7 +2514,172 @@ function Send-Notify {
 
     if ($Tag) { $script:ToastSeen[$Tag] = Get-Date }
     if (-not $Quiet) { Write-Log ('通知[' + $via + ']: ' + $Title + ' —— ' + $Message) }
+
+    # 同一个事件顺手推到微信 / QQ(配了才推,失败的只写日志)
+    if (-not $Quiet) { [void](Send-Push -Title $Title -Message $Message) }
     return $sent
+}
+
+# ---------------- 微信 / QQ 推送 ----------------
+# 个人微信、QQ 都没有官方"给某个号发消息"的接口,所以走中转,配在 push.json(不进仓库):
+#   微信:Server酱(方糖)SendKey / PushPlus token / 企业微信群机器人 webhook
+#   QQ  :OneBot 实现的 HTTP 接口(go-cqhttp、NapCat 等),POST 私聊消息
+#   任意:custom webhook,POST {"title","content"}
+function Get-PushConfig {
+    if (-not $script:PushFn -or -not (Test-Path $script:PushFn)) { return $null }
+    try {
+        $p = Get-Content $script:PushFn -Raw -Encoding UTF8 | ConvertFrom-Json
+        foreach ($k in @('serverchan', 'pushplus', 'wecom', 'onebot', 'custom')) {
+            if (-not $p.PSObject.Properties[$k]) { $p | Add-Member -NotePropertyName $k -NotePropertyValue '' -Force }
+        }
+        return $p
+    } catch {
+        Write-Log ('push.json 解析失败:' + $_.Exception.Message) 'WARN'
+        return $null
+    }
+}
+
+function Save-PushConfig {
+    param($Cfg)
+    try {
+        ($Cfg | Select-Object serverchan, pushplus, wecom, onebot, custom | ConvertTo-Json) |
+            Set-Content -Path $script:PushFn -Encoding UTF8
+        return $true
+    } catch {
+        Write-Log ('保存 push.json 失败:' + $_.Exception.Message) 'ERROR'
+        return $false
+    }
+}
+
+function Send-Push {
+    param([string]$Title, [string]$Message)
+
+    $cfg = Get-PushConfig
+    if (-not $cfg) { return $false }
+    $any = $false
+    foreach ($k in @('serverchan', 'pushplus', 'wecom', 'onebot', 'custom')) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$cfg.$k)) { $any = $true }
+    }
+    if (-not $any) { return $false }
+
+    $ok = 0
+    $bad = @()
+    $text = $Title + "`n" + $Message
+
+    # Server酱 → 微信服务号
+    if (-not [string]::IsNullOrWhiteSpace([string]$cfg.serverchan)) {
+        try {
+            $u = 'https://sctapi.ftqq.com/' + ([string]$cfg.serverchan).Trim() + '.send'
+            # PS 5.1 的 -Body 字符串默认按 ASCII 发,中文会变问号;这里显式转 UTF-8 字节
+            $form = 'title=' + [uri]::EscapeDataString($Title) + '&desp=' + [uri]::EscapeDataString($Message)
+            $r = Invoke-RestMethod -Uri $u -Method Post -ContentType 'application/x-www-form-urlencoded; charset=utf-8' `
+                -Body ([System.Text.Encoding]::UTF8.GetBytes($form)) -TimeoutSec 12 -UseBasicParsing
+            if ($r -and ($r.code -eq 0 -or $r.data)) { $ok++ } else { $bad += ('serverchan:' + [string]$r.code) }
+        } catch { $bad += ('serverchan:' + $_.Exception.Message) }
+    }
+
+    # PushPlus → 微信
+    if (-not [string]::IsNullOrWhiteSpace([string]$cfg.pushplus)) {
+        try {
+            $body = @{ token = ([string]$cfg.pushplus).Trim(); title = $Title; content = $text; template = 'txt' } | ConvertTo-Json
+            $r = Invoke-RestMethod -Uri 'http://www.pushplus.plus/send' -Method Post -ContentType 'application/json; charset=utf-8' -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) -TimeoutSec 12 -UseBasicParsing
+            if ($r -and [int]$r.code -eq 200) { $ok++ } else { $bad += ('pushplus:' + [string]$r.code) }
+        } catch { $bad += ('pushplus:' + $_.Exception.Message) }
+    }
+
+    # 企业微信群机器人
+    if (-not [string]::IsNullOrWhiteSpace([string]$cfg.wecom)) {
+        try {
+            $body = @{ msgtype = 'text'; text = @{ content = $text } } | ConvertTo-Json -Depth 4
+            $r = Invoke-RestMethod -Uri ([string]$cfg.wecom).Trim() -Method Post -ContentType 'application/json; charset=utf-8' `
+                -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) -TimeoutSec 12 -UseBasicParsing
+            if ($r -and [int]$r.errcode -eq 0) { $ok++ } else { $bad += ('wecom:' + [string]$r.errmsg) }
+        } catch { $bad += ('wecom:' + $_.Exception.Message) }
+    }
+
+    # OneBot(QQ):形如 http://127.0.0.1:3000/send_private_msg?user_id=123456
+    if (-not [string]::IsNullOrWhiteSpace([string]$cfg.onebot)) {
+        try {
+            $u = ([string]$cfg.onebot).Trim()
+            $uid = ''
+            if ($u -match '[?&]user_id=(\d+)') { $uid = $Matches[1] }
+            if (-not $uid -and $u -match '[?&]group_id=(\d+)') { $uid = $Matches[1] }
+            $body = @{ message = $text; auto_escape = $true }
+            if ($u -match 'group_id=') {
+                $body['group_id'] = [int]$uid
+                $u2 = $u -replace '[?&]group_id=\d+', ''
+            } else {
+                $body['user_id'] = [int]$uid
+                $u2 = $u -replace '[?&]user_id=\d+', ''
+            }
+            $r = Invoke-RestMethod -Uri $u2 -Method Post -ContentType 'application/json; charset=utf-8' `
+                -Body ([System.Text.Encoding]::UTF8.GetBytes(($body | ConvertTo-Json))) -TimeoutSec 12 -UseBasicParsing
+            if ($r -and ($r.status -eq 'ok' -or $r.retcode -eq 0)) { $ok++ } else { $bad += ('onebot:' + [string]$r.retcode) }
+        } catch { $bad += ('onebot:' + $_.Exception.Message) }
+    }
+
+    # 自定义 webhook
+    if (-not [string]::IsNullOrWhiteSpace([string]$cfg.custom)) {
+        try {
+            $body = @{ title = $Title; content = $text } | ConvertTo-Json
+            [void](Invoke-RestMethod -Uri ([string]$cfg.custom).Trim() -Method Post -ContentType 'application/json; charset=utf-8' `
+                -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) -TimeoutSec 12 -UseBasicParsing)
+            $ok++
+        } catch { $bad += ('custom:' + $_.Exception.Message) }
+    }
+
+    if ($ok -gt 0) { Write-Log ('推送成功: ' + $ok + ' 个通道') }
+    if ($bad.Count -gt 0) { Write-Log ('推送失败: ' + ($bad -join ' ; ')) 'WARN' }
+    return ($ok -gt 0)
+}
+
+function Show-PushConfig {
+    $cfg = Get-PushConfig
+    Write-Stdout ''
+    Write-Stdout '=== 微信 / QQ 推送 ==='
+    if (-not $cfg) { Write-Stdout '  (还没配置,文件: ' + $script:PushFn + ')' }
+    else {
+        foreach ($k in @(
+                @{ K = 'serverchan'; N = 'Server酱 SendKey(微信)' },
+                @{ K = 'pushplus'; N = 'PushPlus token(微信)' },
+                @{ K = 'wecom'; N = '企业微信群机器人 webhook' },
+                @{ K = 'onebot'; N = 'OneBot 地址(QQ)' },
+                @{ K = 'custom'; N = '自定义 webhook' }
+            )) {
+            $v = [string]$cfg.($k.K)
+            $show = $(if (-not $v) { '(未配置)' } elseif ($v.Length -gt 24) { $v.Substring(0, 12) + '…' + $v.Substring($v.Length - 6) } else { $v })
+            Write-Stdout ('  ' + ([string]$k.N).PadRight(28) + $show)
+        }
+    }
+    Write-Stdout '  说明:个人微信/QQ 没有官方发消息接口,上面都是中转服务;掉线、恢复、修复完成时会自动推。'
+    Write-Stdout ('  文件: ' + $script:PushFn)
+    Write-Stdout ''
+}
+
+function Invoke-PushSetup {
+    Show-PushConfig
+    $cfg = Get-PushConfig
+    if (-not $cfg) { $cfg = [pscustomobject]@{ serverchan = ''; pushplus = ''; wecom = ''; onebot = ''; custom = '' } }
+    Write-Stdout '  每一项直接回车 = 保持不变;输入 - = 清空'
+    foreach ($k in @(
+            @{ K = 'serverchan'; N = 'Server酱 SendKey' },
+            @{ K = 'pushplus'; N = 'PushPlus token' },
+            @{ K = 'wecom'; N = '企业微信机器人 webhook' },
+            @{ K = 'onebot'; N = 'OneBot 地址(含 ?user_id=)' },
+            @{ K = 'custom'; N = '自定义 webhook' }
+        )) {
+        $cur = [string]$cfg.($k.K)
+        $ans = Read-Host ('  ' + $k.N + $(if ($cur) { ' [已配置]' } else { '' }))
+        if (-not [string]::IsNullOrWhiteSpace($ans)) {
+            $ans = $ans.Trim()
+            if ($ans -eq '-') { $ans = '' }
+            $cfg.($k.K) = $ans
+        }
+    }
+    if (Save-PushConfig -Cfg $cfg) {
+        Write-Log '推送配置已保存'
+        Show-PushConfig
+    }
 }
 
 # ================= 自动修复(常见毛病的一键处理) =================
@@ -2757,6 +2928,8 @@ $script:PetMediaActions = $null
 $script:PetWeather = $null
 $script:PetWeatherAt = [datetime]::MinValue
 $script:PetWeatherFile = Join-Path $WorkDir 'pet-weather.json'
+# 微信 / QQ 推送配置(只在本机,不进仓库)
+$script:PushFn = Join-Path $WorkDir 'push.json'
 # 彩云天气接口根(测试时可用环境变量指到本地假服务)
 $script:CaiyunApiBase = $(if ($env:CAMPUSNET_CAIYUN_BASE) { [string]$env:CAMPUSNET_CAIYUN_BASE } else { 'https://api.caiyunapp.com' })
 $script:PetMemeCache = @{}
@@ -2991,6 +3164,8 @@ function Get-PetCfg {
         Scale     = $scale
         OverlayFont    = $(if ($s -and $s.PSObject.Properties['petOverlayFont'] -and [double]$s.petOverlayFont -gt 0) { [double]$s.petOverlayFont } else { 9.5 })
         OverlayOpacity = $(if ($s -and $s.PSObject.Properties['petOverlayOpacity'] -and [double]$s.petOverlayOpacity -gt 0) { [double]$s.petOverlayOpacity } else { 0.94 })
+        OverlayW       = $(if ($s -and $s.PSObject.Properties['petOverlayW'] -and [int]$s.petOverlayW -gt 0) { [int]$s.petOverlayW } else { 0 })
+        OverlayH       = $(if ($s -and $s.PSObject.Properties['petOverlayH'] -and [int]$s.petOverlayH -gt 0) { [int]$s.petOverlayH } else { 0 })
         Gravity        = $(if ($s -and $s.PSObject.Properties['petGravity'] -and [int]$s.petGravity -gt 0) { [double]$s.petGravity } else { 1400 })
         Restitution    = $(if ($s -and $s.PSObject.Properties['petRestitution']) { [double]$s.petRestitution } else { 0.78 })
         Friction       = $(if ($s -and $s.PSObject.Properties['petGroundFriction']) { [double]$s.petGroundFriction } else { 2.5 })
@@ -3540,16 +3715,11 @@ function New-PetOverlayWindow {
             $fs = $(if ($script:PetOverlayFontSize) { $script:PetOverlayFontSize } else { 9.5 })
             $lh = $(if ($script:PetOverlayLineH) { $script:PetOverlayLineH } else { 22 })
             $pd = $(if ($script:PetOverlayPad) { $script:PetOverlayPad } else { 10 })
-            if ($c.Kind -eq 'say') {
-                $sf = New-Object System.Drawing.Font -ArgumentList 'Microsoft YaHei UI', $fs
-                $g.DrawString($c.Text, $sf, [System.Drawing.Brushes]::White, $pd, $pd)
-                $sf.Dispose()
-                return
-            }
+            # 换行/截断在 Set-PetOverlayContent 里已经算好,这里照着逐行画就行
             $font = New-Object System.Drawing.Font -ArgumentList 'Microsoft YaHei UI', $fs
             $y = $pd
             foreach ($ln in $c.Lines) {
-                $g.DrawString($ln, $font, [System.Drawing.Brushes]::White, $pd, $y)
+                $g.DrawString([string]$ln, $font, [System.Drawing.Brushes]::White, $pd, $y)
                 $y += $lh
             }
             foreach ($b in $c.Buttons) {
@@ -3615,82 +3785,146 @@ function New-PetOverlayWindow {
     $f.Visible = $false
 }
 
+function Get-WrappedText {
+    # 按像素宽度把一行拆成多行(中文逐字拆,够用且简单)
+    param([string]$Text, $Font, [int]$MaxWidth, $Graphics)
+    $out = @()
+    if ([string]::IsNullOrEmpty($Text)) { return $out }
+    if ($MaxWidth -le 20 -or -not $Graphics) { return @($Text) }
+    $cur = ''
+    foreach ($ch in $Text.ToCharArray()) {
+        $try = $cur + $ch
+        if ($cur -and ($Graphics.MeasureString($try, $Font)).Width -gt $MaxWidth) {
+            # 别把英文/数字词从中间劈开:能退到最近的空格就退
+            if ($ch -match '[0-9A-Za-z]') {
+                $sp = $cur.LastIndexOf(' ')
+                if ($sp -gt 0) {
+                    $out += $cur.Substring(0, $sp)
+                    $cur = $cur.Substring($sp + 1) + $ch
+                    continue
+                }
+            }
+            $out += $cur
+            $cur = [string]$ch
+        } else {
+            $cur = $try
+        }
+    }
+    if ($cur) { $out += $cur }
+    return $out
+}
+
 function Set-PetOverlayContent {
     # Kind: info(网速+天气+音乐) / meme(表情包) / say(碎碎念气泡)
+    # 尺寸:settings 里 petOverlayW / petOverlayH 给了就固定(文本自动换行 + 超长截断),给 0 就按内容自适应
     param([string]$Kind, $Meme = $null, [string]$Text = '')
 
     if (-not $script:PetOverlay) { return }
     if ($script:PetOverlayKind -eq 'meme' -and $Kind -eq 'meme') { return }
 
-    $lines = New-Object System.Collections.ArrayList
+    $rawLines = New-Object System.Collections.ArrayList
     $buttons = @()
     $w = 250
     $h = 0
+    $cfg = Get-PetCfg
+    $fontSize = [double]$cfg.OverlayFont
+    $pad = [int][Math]::Round($fontSize * 1.15)
+    $lineH = [int][Math]::Ceiling($fontSize * 2.3)
+    $fixedW = [int]$cfg.OverlayW
+    $fixedH = [int]$cfg.OverlayH
 
-    if ($Kind -eq 'say') {
-        $cfg = Get-PetCfg
-        $fs = [double]$cfg.OverlayFont
-        $pad = [int][Math]::Round($fs * 1.2)
-        $lineH = [int][Math]::Ceiling($fs * 2.3)
-        $mf = New-Object System.Drawing.Font -ArgumentList 'Microsoft YaHei UI', $fs
-        $mb = New-Object System.Drawing.Bitmap -ArgumentList 1, 1
-        $mg = [System.Drawing.Graphics]::FromImage($mb)
-        $sz = $mg.MeasureString($Text, $mf)
-        $mg.Dispose(); $mb.Dispose(); $mf.Dispose()
-        $w = [int][Math]::Ceiling($sz.Width) + $pad * 2 + 6
-        $h = $lineH + $pad * 2
-        if ($w -lt 90) { $w = 90 }
-        $script:PetOverlayFontSize = $fs
-        $script:PetOverlayLineH = $lineH
-        $script:PetOverlayPad = $pad
-        $script:PetOverlayText = $Text
-        $buttons = @(@{ X = 0; Y = 0; W = $w; H = $h; Action = 'meme'; Glyph = '' })
-        $script:PetOverlay.Opacity = [double]$cfg.OverlayOpacity
-    } elseif ($Kind -eq 'meme' -and $Meme) {
+    if ($Kind -eq 'meme' -and $Meme) {
         $w = [Math]::Min(300, $Meme.Width)
         $h = [int]([Math]::Round($Meme.Height * $w / $Meme.Width))
         $buttons = @(@{ X = 0; Y = 0; W = $w; H = $h; Action = 'meme'; Glyph = '' })
         $script:PetOverlay.Opacity = 1.0
     } else {
-        $sp = Get-NetSpeed
-        if (-not $sp) { $sp = [pscustomobject]@{ DownText = '—'; UpText = '—' } }
-        [void]$lines.Add('↓ ' + $sp.DownText + '   ↑ ' + $sp.UpText)
-        $wx = Format-PetWeather
-        if ($wx) { [void]$lines.Add('☁ ' + $wx) }
-        $media = Get-PetMedia
-        if ($media -and $media.Ok) { [void]$lines.Add('♪ ' + (Format-PetMediaLine)) }
+        $media = $null
+        if ($Kind -eq 'say') {
+            [void]$rawLines.Add($Text)
+        } else {
+            $sp = Get-NetSpeed
+            if (-not $sp) { $sp = [pscustomobject]@{ DownText = '—'; UpText = '—' } }
+            [void]$rawLines.Add('↓ ' + $sp.DownText + '   ↑ ' + $sp.UpText)
+            $wx = Format-PetWeather
+            if ($wx) { [void]$rawLines.Add('☁ ' + $wx) }
+            $media = Get-PetMedia
+            if ($media -and $media.Ok) { [void]$rawLines.Add('♪ ' + (Format-PetMediaLine)) }
+        }
 
-        # 宽度按最长那行文字自适应,不再固定 250
-        $cfg = Get-PetCfg
-        $fontSize = [double]$cfg.OverlayFont
-        $pad = [int][Math]::Round($fontSize * 1.1)
-        $lineH = [int][Math]::Ceiling($fontSize * 2.3)
+        # 量一遍:固定宽度就换行,固定高度就截断
         $measureFont = New-Object System.Drawing.Font -ArgumentList 'Microsoft YaHei UI', $fontSize
         $mb = New-Object System.Drawing.Bitmap -ArgumentList 1, 1
         $mg = [System.Drawing.Graphics]::FromImage($mb)
+
+        $lines = New-Object System.Collections.ArrayList
         $textW = 0
-        foreach ($ln in $lines) {
-            $sz = $mg.MeasureString($ln, $measureFont)
-            if ($sz.Width -gt $textW) { $textW = $sz.Width }
+        if ($fixedW -gt 0) {
+            $maxText = $fixedW - $pad * 2 - 4
+            foreach ($ln in $rawLines) {
+                foreach ($seg in (Get-WrappedText -Text ([string]$ln) -Font $measureFont -MaxWidth $maxText -Graphics $mg)) {
+                    [void]$lines.Add($seg)
+                    $sw = ($mg.MeasureString($seg, $measureFont)).Width
+                    if ($sw -gt $textW) { $textW = $sw }
+                }
+            }
+        } else {
+            foreach ($ln in $rawLines) {
+                [void]$lines.Add([string]$ln)
+                $sw = ($mg.MeasureString([string]$ln, $measureFont)).Width
+                if ($sw -gt $textW) { $textW = $sw }
+            }
         }
         $mg.Dispose(); $mb.Dispose(); $measureFont.Dispose()
 
-        $w = [int][Math]::Ceiling($textW) + $pad * 2 + 4
-        $h = $pad * 2 + $lines.Count * $lineH
-        if ($media -and $media.Ok) {
-            $h += 36
-            # 三个按钮要给够宽度
-            $need = $pad * 2 + 54 * 3 + 10 * 2
-            if ($w -lt $need) { $w = $need }
+        # 媒体按钮占的高度
+        $btnH = 0
+        if ($media -and $media.Ok -and $Kind -ne 'say') { $btnH = 36 }
+
+        if ($fixedH -gt 0) {
+            # 高度固定:能放几行放几行,放不下的截断并加省略号
+            $avail = $fixedH - $pad * 2 - $btnH
+            $maxLines = [Math]::Max(1, [int][Math]::Floor($avail / $lineH))
+            if ($lines.Count -gt $maxLines) {
+                $keep = @()
+                for ($i = 0; $i -lt $maxLines; $i++) { $keep += [string]$lines[$i] }
+                $last = $keep[$maxLines - 1]
+                if ($last.Length -gt 1) { $keep[$maxLines - 1] = $last.Substring(0, $last.Length - 1) + '…' }
+                $lines = New-Object System.Collections.ArrayList
+                foreach ($k in $keep) { [void]$lines.Add($k) }
+            }
         }
-        if ($w -lt 150) { $w = 150 }
+
+        if ($fixedW -gt 0) {
+            $w = $fixedW
+        } else {
+            $w = [int][Math]::Ceiling($textW) + $pad * 2 + 6
+            if ($media -and $media.Ok -and $Kind -ne 'say') {
+                $need = $pad * 2 + 54 * 3 + 10 * 2
+                if ($w -lt $need) { $w = $need }
+            }
+            $minW = $(if ($Kind -eq 'say') { 90 } else { 150 })
+            if ($w -lt $minW) { $w = $minW }
+        }
+
+        if ($fixedH -gt 0) {
+            $h = $fixedH
+        } else {
+            $h = $pad * 2 + $lines.Count * $lineH + $btnH
+            if ($Kind -eq 'say') { $h = $pad * 2 + $lineH }
+        }
+
         $script:PetOverlayFontSize = $fontSize
         $script:PetOverlayLineH = $lineH
         $script:PetOverlayPad = $pad
+        $script:PetOverlayText = $Text
 
-        if ($media -and $media.Ok) {
-            $bw = 54; $bh = 26; $gap = 10; $bx = $pad
+        if ($Kind -eq 'say') {
+            $buttons = @(@{ X = 0; Y = 0; W = $w; H = $h; Action = 'meme'; Glyph = '' })
+        } elseif ($media -and $media.Ok) {
+            $bw = 54; $bh = 26; $gap = 10; $bx = [int]$pad
             $by = $h - $pad - $bh
+            if ($by -lt 0) { $by = 0 }
             foreach ($it in @(
                     @{ Action = 'prev'; Glyph = 'prev' },
                     @{ Action = 'playpause'; Glyph = $(if ($media.Playing) { 'pause' } else { 'play' }) },
@@ -3701,11 +3935,12 @@ function Set-PetOverlayContent {
             }
         }
         $script:PetOverlay.Opacity = [double]$cfg.OverlayOpacity
+        $rawLines = $lines
     }
 
     $script:PetOverlayContent = [pscustomobject]@{
         Kind    = $Kind
-        Lines   = @($lines)
+        Lines   = @($rawLines)
         Buttons = $buttons
         Meme    = $Meme
         Text    = $Text
@@ -4256,6 +4491,35 @@ function New-PetMenu {
             } catch { }
         })
     [void]$menu.Items.Add($miCity)
+
+    # 悬浮面板尺寸(长宽可调;0 = 自动)
+    $miOverlay = New-Object System.Windows.Forms.ToolStripMenuItem
+    $miOverlay.Text = '悬浮面板尺寸…'
+    $miOverlay.add_Click({
+            try {
+                Add-Type -AssemblyName Microsoft.VisualBasic -ErrorAction Stop
+                $st = Get-Settings
+                $cw = $(if ($st.petOverlayW) { [int]$st.petOverlayW } else { 0 })
+                $ch = $(if ($st.petOverlayH) { [int]$st.petOverlayH } else { 0 })
+                $ans = [Microsoft.VisualBasic.Interaction]::InputBox('宽,高(像素;0 = 自动)。例:320,0 或 320,120', '悬浮面板尺寸', ($cw.ToString() + ',' + $ch.ToString()))
+                if ($null -ne $ans -and $ans.Trim()) {
+                    $parts = @($ans -split '[,，xX* ]+' | Where-Object { $_ -ne '' })
+                    $nw = 0; $nh = 0
+                    if ($parts.Count -ge 1) { [void][int]::TryParse([string]$parts[0], [ref]$nw) }
+                    if ($parts.Count -ge 2) { [void][int]::TryParse([string]$parts[1], [ref]$nh) }
+                    if ($nw -lt 0) { $nw = 0 }
+                    if ($nh -lt 0) { $nh = 0 }
+                    $st.petOverlayW = $nw
+                    $st.petOverlayH = $nh
+                    Save-Settings -Settings $st
+                    $script:PetCfg = $null
+                    $script:PetCfgAt = [datetime]::MinValue
+                    Write-Log ('悬浮面板尺寸: ' + $(if ($nw -gt 0) { $nw } else { '自动' }) + ' × ' + $(if ($nh -gt 0) { $nh } else { '自动' }))
+                    if ($script:PetOverlayKind -eq 'info') { Set-PetOverlayContent -Kind 'info' }
+                }
+            } catch { }
+        })
+    [void]$menu.Items.Add($miOverlay)
 
     [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 
@@ -5942,6 +6206,7 @@ function Show-Menu {
         Write-Stdout ('       (当前: ' + $curProto + ')')
         Write-Stdout '  C) 采集诊断包(远程排查用,自动复制到剪贴板)'
         Write-Stdout '  G) 新手向导(问一句是不是校园网 + 认门户)'
+        Write-Stdout '  N) 微信 / QQ 推送设置'
         Write-Stdout '  L) 查看日志'
         Write-Stdout '  0) 退出'
         Write-Stdout '=================================================='
@@ -6043,6 +6308,7 @@ function Show-Menu {
             'L' { Show-Log }
             'C' { Invoke-Collect }
             'G' { Invoke-Wizard }
+            'N' { Invoke-PushSetup }
             '0' { return }
             default { Write-Stdout '无效选择' }
         }
@@ -6096,6 +6362,16 @@ switch ($Mode) {
     'log'       { Show-Log }
     'collect'   { Invoke-Collect; exit 0 }
     'wizard'    { Invoke-Wizard; exit 0 }
+
+    'push' {
+        # 手动验一下推送通不通(排查"我这边没收到微信/QQ 消息"用)
+        if (-not (Get-PushConfig)) { Write-Stdout '还没配置 push.json —— 先开菜单选 N) 微信 / QQ 推送设置'; exit 1 }
+        $okPush = Send-Push -Title '校园网推送自检' -Message ('能看到这条,说明推送通道通了 ' + (Get-Date -Format 'HH:mm:ss'))
+        Show-PushConfig
+        if ($okPush) { Write-Stdout '推送成功'; exit 0 }
+        Write-Stdout '推送失败 —— 看日志里的「推送失败」那一行'
+        exit 1
+    }
     'synctime'  { [void](Sync-Clock -Always) }
 
     'wifi'      { if (Test-WifiConnected -Ssid $WifiSsid) { exit 0 } else { exit 1 } }

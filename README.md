@@ -70,6 +70,7 @@ wlanuserip=10.1.2.3&service=internet&username={user}&password={pwd}
   R) 一键修复(重置网卡 / 刷 DNS / 清 Cookie)
   P) 桌面宠物: 开/关切换
   G) 新手向导(问一句是不是校园网 + 认门户)
+  N) 微信 / QQ 推送设置
   C) 采集诊断包(远程排查用,自动复制到剪贴板)
   L) 查看日志
   0) 退出
@@ -344,6 +345,11 @@ Windows 的 WiFi 列表是**缓存**的:刚开机、刚唤醒、刚从别的网�
   - 数据源:**彩云天气**(要在菜单 `W` 里填 token,能拿到实时天气、体感温度、穿衣指数和预警);没填 token 或取数失败时自动回退 `Open-Meteo`
   - **穿衣提醒**:按体感温度分档(短袖 / 薄长袖 / 卫衣 / 外套 / 羽绒服……),再按天气追加「带伞 / 戴口罩 / 风大 / 多喝水」;彩云的穿衣等级会跟在括号里(如 `短袖 T 恤,带伞(舒适)`)
   - `30 分钟`缓存一次,同时显示在**校时菜单顶部**和悬停面板里
+- **悬停面板尺寸可调**:宠物右键 →「悬浮面板尺寸…」,填 `宽,高`(像素;`0` = 自动)
+  - 只填宽(`320,0`)→ 固定宽、自动高,长文本按像素**自动换行**
+  - 宽高都填(`320,110`)→ 固定框,放不下的行**截断并加省略号**,不会溢出
+  - 英文/数字不会被从中间劈开(能退到空格就退)
+  - 字号/透明度还是原来那两个设置(`petOverlayFont` / `petOverlayOpacity`)
 - **音乐**:走 Windows 的 GSMTC(全局媒体传输控制),任何在系统里注册了媒体会话的播放器(网易云/QQ音乐/Spotify/浏览器)都能认出来;**上一曲/播放暂停/下一曲三个按钮点一下真的会去控制播放器**
 - 没有播放器时,音乐行和按钮自动不显示,面板就两行
 
@@ -590,6 +596,11 @@ GET http://www.msftconnecttest.com/connecttest.txt   → 302  Location: <门户�
 .\Connect-CampusNet.ps1 -Mode install -NoTray  # 安装成纯后台(无图标)
 .\Connect-CampusNet.ps1 -Mode install -Elevated # 以管理员身份运行任务(能自动改时间)
 .\Connect-CampusNet.ps1 -Mode uninstall      # 卸载
+.\Connect-CampusNet.ps1 -Mode push           # 发一条微信/QQ 推送自检(先配 push.json)
+.\Connect-CampusNet.ps1 -Mode weather        # 取一次天气(位置+穿衣),写入缓存
+.\Connect-CampusNet.ps1 -Mode weather -CaiyunToken xxxx   # 顺便设彩云 token
+.\Connect-CampusNet.ps1 -Mode collect        # 采集诊断包(远程排查)
+.\Connect-CampusNet.ps1 -Mode wizard         # 新手向导
 ```
 
 其他参数:`-Background`(绝不弹交互,任务用)、`-NoVbs`(不用 VBS,可能有极短黑框但任务托管更规范)、`-MachineScope`(机器级加密)、`-IntervalSec 60`、`-Force`、`-RepairLevel safe|full`、`-NoRepair`、`-Resume`(唤醒后补认证用)。
@@ -723,6 +734,17 @@ rememberPwd=0
 
 ## 更新日志
 
+### v1.1.5(2026-10-18)
+
+- **新增** 微信 / QQ 通知:通知中心之外再推一份到手机
+  - 支持 Server酱、PushPlus(微信)、企业微信群机器人、OneBot(QQ,go-cqhttp/NapCat)、自定义 webhook
+  - 菜单 `N` 配置(回车不变、`-` 清空),`-Mode push` 发一条自检;多通道并行
+  - 复用原来的去重间隔,掉线/恢复/修复完成等事件不会刷屏
+  - 修:PS 5.1 的 `-Body` 默认按 ASCII 发,中文会变问号 —— 全部改成显式 UTF-8 字节发送
+- **新增** 桌宠悬停面板**长宽可调 + 文本自适应**:宠物右键 →「悬浮面板尺寸…」
+  - `宽,高`,0 = 自动;固定宽会长文本换行,固定高会截断加省略号,英文/数字不劈词
+- `push.json` 加进 `.gitignore`(里面有你的 SendKey/token)
+
 ### v1.1.4(2026-10-18)
 
 - **天气位置改成「省 / 市 / 区县」三级**
@@ -778,6 +800,33 @@ rememberPwd=0
 ### v1.0.0(2026-10-17)
 
 首个公开版本:菜单 / 托盘 / 开机自启 / 多账号 / 自动连 WiFi / 校时 / 网速 / 一键诊断 / 门户改版自检 / 通知中心 / 唤醒重认证 / 自动修复 / 桌面宠物 / 配置驱动的通用门户。
+
+## 微信 / QQ 通知
+
+系统的通知中心只在电脑前才有用。想让手机也响一下,可以接**推送中转**——配置写在 `push.json`(本机文件,不进仓库)。
+
+> **先说清楚**:个人微信、QQ 都没有官方"给某个号发消息"的接口。下面这些都是**中转服务**,不是直接发到你的微信号/QQ 号上;它们合不合规、能收几条,follow 各家自己的规则。
+
+| 通道 | 推到哪 | 怎么拿 |
+| --- | --- | --- |
+| `serverchan` | 微信服务号 | [Server酱](https://sct.ftqq.com) 登录 → 拿 **SendKey**(形如 `SCTxxxxx`) |
+| `pushplus` | 微信 | [PushPlus](http://www.pushplus.plus) 登录 → 拿 **token** |
+| `wecom` | 企业微信群 | 群设置 → 群机器人 → 复制 **Webhook 地址** |
+| `onebot` | QQ(私聊/群) | 自建 [OneBot](https://onebot.dev) 实现(go-cqhttp、NapCat 等),填 `http://127.0.0.1:3000/send_private_msg?user_id=123456` |
+| `custom` | 任意 | 你自己的 webhook,会 POST `{"title","content"}` |
+
+**怎么配**
+
+```powershell
+.\Connect-CampusNet.ps1              # 菜单 → N) 微信 / QQ 推送设置
+.\Connect-CampusNet.ps1 -Mode push   # 立刻发一条自检消息,验证通不通
+```
+
+菜单里每项直接回车 = 不变,输入 `-` = 清空;可以同时配多个通道,会并行推送。
+
+**什么时候会推**:和系统通知完全一致——掉线、恢复在线、自动修复完成、唤醒后重认证失败、登录连续失败。同一个事件不会重复刷屏(沿用原来的去重间隔)。
+
+> 实测:用本地假 webhook 验证过 POST 的 JSON 内容和 UTF-8 编码(中文不乱码)。真实微信/QQ 通道需要你自己申请凭据才能端到端验证。
 
 ## 远程适配(朋友不在现场怎么办)
 
