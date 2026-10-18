@@ -103,7 +103,7 @@ $VbsFile    = Join-Path $WorkDir 'run-hidden.vbs'
 $TaskName   = 'CampusNet-AutoLogin'
 $RepairTaskName = 'CampusNet-Repair'
 $UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-$script:AppVersion = '1.2.2'
+$script:AppVersion = '1.2.3'
 $Curl = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
 $script:NicList = $null
 $script:NicListAt = [datetime]::MinValue
@@ -3148,6 +3148,24 @@ function Get-PetFrames {
         if ($a.id -eq $Anim -and $a.PSObject.Properties['fps'] -and [int]$a.fps -gt 0) { $fps = [int]$a.fps }
     }
 
+    # 统一画布:每个动作的裁剪框大小不一样,不垫到同一块画布的话,
+    # 切换动作时窗口会突然缩放/移位(看着就是「突兀的缩放」)。
+    # canvas/ox/oy 由 build 脚本写进 pet.json;老素材没有这些字段就按每帧自己的尺寸走。
+    $man = Get-PetManifest
+    $canvasW = 0; $canvasH = 0; $oxS = 0; $oyS = 0
+    if ($man -and $man.PSObject.Properties['canvas'] -and $man.canvas) {
+        $canvasW = [int][Math]::Round([double]$man.canvas.w * $Scale)
+        $canvasH = [int][Math]::Round([double]$man.canvas.h * $Scale)
+        foreach ($a in (Get-PetAnimList)) {
+            if ([string]$a.id -eq $Anim -and $a.PSObject.Properties['ox']) {
+                $oxS = [int][Math]::Round([double]$a.ox * $Scale)
+                $oyS = [int][Math]::Round([double]$a.oy * $Scale)
+                break
+            }
+        }
+        if ($canvasW -lt 1) { $canvasW = 0 }
+    }
+
     $hbs = New-Object System.Collections.ArrayList
     $w = 0; $h = 0
 
@@ -3155,7 +3173,10 @@ function Get-PetFrames {
     $targetFps = [int](Get-PetCfg).Fps
     if ($targetFps -lt 12) { $targetFps = 12 }
     $k = 1
-    if ($targetFps -gt [int]($fps * 1.2)) { $k = 2 }
+    # 长动作(整段 10 秒、上百帧)也插帧,否则 12fps 素材看着一顿一顿的;
+    # 但 idle/sleep/walk 是慢速循环,不插(省内存)
+    $interpOk = (($files.Count -le 90) -or ($Anim -notin @('idle', 'sleep', 'walk')))
+    if ($targetFps -gt [int]($fps * 1.2) -and $interpOk) { $k = 2 }
     # 内存闸门:一个动作最多 300 帧(约 80MB),再高就不插了
     if (($files.Count * $k) -gt 300) {
         Write-Log ('帧插值跳过:' + $Anim + ' 帧数偏多(' + $files.Count + ' × ' + $k + ')') 'WARN'
@@ -3189,6 +3210,17 @@ function Get-PetFrames {
             }
             # 配色变体:把颜色矩阵烘进帧,播放时零开销
             if ($script:PetTint) { $bmp = Apply-PetTint -Bitmap $bmp -Matrix $script:PetTint }
+            # 垫进统一画布(不缩放,只改位置):切换动作时窗口尺寸和角色位置都不变
+            if ($canvasW -gt 0 -and ($bmp.Width -ne $canvasW -or $bmp.Height -ne $canvasH)) {
+                $pad = New-Object System.Drawing.Bitmap -ArgumentList $canvasW, $canvasH, ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+                $gp = [System.Drawing.Graphics]::FromImage($pad)
+                $gp.CompositingMode = [System.Drawing.Drawing2D.CompositingMode]::SourceCopy
+                $gp.Clear([System.Drawing.Color]::Transparent)
+                $gp.DrawImage($bmp, $oxS, $oyS, $bmp.Width, $bmp.Height)
+                $gp.Dispose()
+                $bmp.Dispose()
+                $bmp = $pad
+            }
             if ($w -eq 0) { $w = $bmp.Width; $h = $bmp.Height }
 
             # 上一帧和这一帧之间插一张(顺序:帧0 → 混合 → 帧1 → …)
@@ -4151,7 +4183,8 @@ function Play-PetAction {
     elseif ($ms -gt 0) { $dur = $ms / 1000.0 }
     else { $dur = ($entry.Count / $fps) }
     # 素材只有一段,来回播(0→末→0)接缝最自然;pet.json 里写 "pingpong": false 可以关掉
-    $pingpong = $true
+    # 整段素材(没有 ms)就直着播一遍;只有老素材(短片段 + ms)才循环
+    $pingpong = ($ms -gt 0)
     if ($meta -and $meta.PSObject.Properties['pingpong']) { $pingpong = [bool]$meta.pingpong }
     $script:PetAction = $Id
     $script:PetActionStart = Get-Date
@@ -4162,7 +4195,7 @@ function Play-PetAction {
     $script:PetLastIdx = -1
     if ($script:PetSw) { $script:PetSw.Restart() }
     $script:PetStillSince = (Get-Date).AddSeconds($dur)
-    Write-Log ('宠物动作:' + (Get-PetLabel $Id) + ' ' + [Math]::Round($dur, 1) + ' 秒' + $(if ($pingpong) { '(往返循环)' } else { '(循环)' }))
+    Write-Log ('宠物动作:' + (Get-PetLabel $Id) + ' ' + [Math]::Round($dur, 1) + ' 秒' + $(if ($pingpong) { '(往返循环)' } elseif ($ms -gt 0) { '(循环)' } else { '(整段 ' + [Math]::Round($dur, 1) + ' 秒)' }))
 }
 
 function Start-PetWander {
