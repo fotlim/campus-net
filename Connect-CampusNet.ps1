@@ -103,7 +103,7 @@ $VbsFile    = Join-Path $WorkDir 'run-hidden.vbs'
 $TaskName   = 'CampusNet-AutoLogin'
 $RepairTaskName = 'CampusNet-Repair'
 $UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-$script:AppVersion = '1.2.4'
+$script:AppVersion = '1.2.5'
 $Curl = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
 $script:NicList = $null
 $script:NicListAt = [datetime]::MinValue
@@ -3274,9 +3274,10 @@ function Get-PetFrames {
 
     $entry = [pscustomobject]@{ Hbs = $hbs; W = $w; H = $h; Count = $hbs.Count; Fps = ($fps * $k) }
     $script:PetCache[$key] = $entry
-    if ($script:PetCache.Count -gt 3) {
+    # 24fps 整段动作一帧要 250KB 上下,缓存只留「当前动作 + idle」两个,免得吃几百 MB
+    if ($script:PetCache.Count -gt 2) {
         foreach ($k in @($script:PetCache.Keys)) {
-            if ($k -eq $key -or $k -like 'idle@*' -or $k -like 'walk@*') { continue }
+            if ($k -eq $key -or $k -like 'idle@*') { continue }
             foreach ($hb in $script:PetCache[$k].Hbs) { [CampusNetPet.Layered]::FreeHBitmap($hb) }
             $script:PetCache.Remove($k)
         }
