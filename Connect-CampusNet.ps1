@@ -103,7 +103,7 @@ $VbsFile    = Join-Path $WorkDir 'run-hidden.vbs'
 $TaskName   = 'CampusNet-AutoLogin'
 $RepairTaskName = 'CampusNet-Repair'
 $UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-$script:AppVersion = '1.2.8'
+$script:AppVersion = '1.2.9'
 $Curl = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
 $script:NicList = $null
 $script:NicListAt = [datetime]::MinValue
@@ -4292,17 +4292,6 @@ function Play-PetAction {
     # 整段素材(没有 ms)就直着播一遍;只有老素材(短片段 + ms)才循环
     $pingpong = ($ms -gt 0)
     if ($meta -and $meta.PSObject.Properties['pingpong']) { $pingpong = [bool]$meta.pingpong }
-    # 交叉淡入:起点用「最后画的那一帧」重新解码出来的透明位图(不能用 HBITMAP 转,会丢 alpha)
-    $fadeSrc = $null
-    try { $fadeSrc = Get-PetFrameBitmap -Anim $script:PetLastAnim -Index $script:PetLastFrameIdx } catch { $fadeSrc = $null }
-    if (-not $fadeSrc) { Write-Log ('动作过渡:起点取不到 anim=[' + $script:PetLastAnim + '] idx=' + $script:PetLastFrameIdx) 'WARN' }
-    if ($fadeSrc) {
-        if ($script:PetFadeFromBmp) { try { $script:PetFadeFromBmp.Dispose() } catch { } }
-        $script:PetFadeFromBmp = $fadeSrc
-        $script:PetFadeTotal = 3
-        $script:PetFadeLeft = 3
-        Write-Log ('动作过渡:' + $Id + ' 交叉淡入 3 帧(125ms)')
-    }
     $script:PetAction = $Id
     $script:PetActionStart = Get-Date
     $script:PetActionPingPong = $pingpong
@@ -4335,7 +4324,7 @@ function Step-PetWander {
         $script:PetYf = $script:PetTarget.Y
         $script:PetTarget = $null
         $script:PetStillSince = Get-Date
-        try { [void](Invoke-IconEventNearPet -Source 'wander' -Chance 60) } catch { }
+        try { [void](Invoke-IconEventNearPet -Source 'wander' -Chance 25) } catch { }
         return
     }
     # 浮点累加,每秒约 96px;取整只在绘制时做,不会有整数截断造成的抖动
@@ -4467,18 +4456,6 @@ function Update-Pet {
 
     $anim = Get-PetCurrentAnim
     if ($anim -ne $script:PetAnim) {
-        # 从 idle 切到动作时快速淡入(3 帧 ≈ 125ms):够柔,又不会让两副姿势叠着看
-        if ($script:PetLastHb -ne [IntPtr]::Zero) {
-            try {
-                if ($script:PetFadeFromBmp) { $script:PetFadeFromBmp.Dispose() }
-                $script:PetFadeFromBmp = Get-PetFrameBitmap -Anim $script:PetLastAnim -Index $script:PetLastFrameIdx
-                $script:PetFadeTotal = 3
-                $script:PetFadeLeft = 3
-                Write-Log ('动作过渡:' + $anim + ' 交叉淡入 3 帧')
-            } catch { $script:PetFadeFromBmp = $null; $script:PetLastHb = [IntPtr]::Zero
-$script:PetLastAnim = ''
-$script:PetLastFrameIdx = 0 }
-        }
         $script:PetAnim = $anim
         $script:PetLastIdx = -1
         $script:PetSw.Restart()
@@ -4531,33 +4508,7 @@ $script:PetLastFrameIdx = 0
         if ($script:PetForm.ClientSize.Width -ne $entry.W -or $script:PetForm.ClientSize.Height -ne $entry.H) {
             $script:PetForm.ClientSize = New-Object System.Drawing.Size -ArgumentList $entry.W, $entry.H
         }
-        $hbNow = $entry.Hbs[$idx]
-        $ownHb = $false
-        if ($script:PetFadeLeft -gt 0 -and $script:PetFadeFromBmp) {
-            # 过渡期:把「上一帧」和当前帧按比例混出来再贴
-            try {
-                $fa = 0.4 + 0.6 * (1.0 - ($script:PetFadeLeft / [double]$script:PetFadeTotal))
-                # 新帧也要用「重解出来的透明位图」,HBITMAP 转出来的会丢 alpha(混出来就是一团黑底)
-                $fb = Get-PetFrameBitmap -Anim $anim -Index $idx
-                $fm = 
-                if ($fb) { $fm = Merge-PetBitmap -A $script:PetFadeFromBmp -B $fb -Alpha $fa; $fb.Dispose() }
-                if ($fm) {
-                    $hbNow = [CampusNetPet.Layered]::ToHBitmap($fm)
-                    $fm.Dispose()
-                    $ownHb = $true
-                }
-            } catch { }
-            $script:PetFadeLeft--
-            if ($script:PetFadeLeft -le 0) {
-                try { $script:PetFadeFromBmp.Dispose() } catch { }
-                $script:PetFadeFromBmp = $null
-            }
-        }
-        $script:PetLastHb = $entry.Hbs[$idx]
-        $script:PetLastAnim = $anim
-        $script:PetLastFrameIdx = $idx
-        $null = [CampusNetPet.Layered]::Draw($script:PetForm.Handle, $hbNow, $entry.W, $entry.H, $px, $py, [byte]255)
-        if ($ownHb) { try { [CampusNetPet.Layered]::FreeHBitmap($hbNow) } catch { } }
+        $null = [CampusNetPet.Layered]::Draw($script:PetForm.Handle, $entry.Hbs[$idx], $entry.W, $entry.H, $px, $py, [byte]255)
         $script:PetX = $px
         $script:PetY = $py
         $script:PetLastDrawX = $px
@@ -5047,6 +4998,10 @@ function Invoke-IconEat {
     # 吃掉 = 挪到屏幕外,到点(默认 180 秒)自己搬回来
     param($Icon, $Data)
     if (-not $Icon) { return $false }
+    if ($script:IconEaten -and $script:IconEaten.Count -ge 1) {
+        Write-Log '已经吃掉一个图标了,等它回原位再吃下一个'
+        return $false
+    }
     $d = Get-DesktopIconList
     if (-not $d) { return $false }
     if (-not (Set-DesktopAutoArrangeOff -Data $d)) { return $false }
@@ -5116,13 +5071,15 @@ function Invoke-IconTidy {
     }
     $cw = [int]$d.Spacing[0]; $ch = [int]$d.Spacing[1]
     $margin = 8
+    # 竖向排:先往下排满一列,再排右边一列
     $cols = [Math]::Max(1, [int][Math]::Floor(($script:ScreenW - $margin) / $cw))
+    $rowsMax = [Math]::Max(1, [int][Math]::Floor(($script:ScreenH - $margin) / $ch))
     for ($i = 0; $i -lt $rows.Count; $i++) {
-        $col = $i % $cols
-        $row = [int][Math]::Floor($i / $cols)
+        $row = $i % $rowsMax
+        $col = [int][Math]::Floor($i / $rowsMax)
+        if ($col -ge $cols) { break }
         $x = $margin + $col * $cw
         $y = $margin + $row * $ch
-        if ($y -gt ($script:ScreenH - $ch)) { break }
         [DeskPet.DeskIcons]::SetPos($d.Lv, $rows[$i].Index, $x, $y)
     }
     Write-Log ('图标互动:整理 ' + $rows.Count + ' 个图标,排法「' + $method + '」') 'OK'
@@ -5851,7 +5808,7 @@ function Start-Pet {
                     # 甩出去:按松手瞬间的速度给一个初速,之后交给重力
                     $speed = [Math]::Sqrt($script:PetDrag.VX * $script:PetDrag.VX + $script:PetDrag.VY * $script:PetDrag.VY)
                     if ($speed -gt 120) { Start-PetPhysics -Vx $script:PetDrag.VX -Vy $script:PetDrag.VY }
-                    try { [void](Invoke-IconEventNearPet -Source 'drop') } catch { }
+                    try { [void](Invoke-IconEventNearPet -Source 'drop' -Chance 45) } catch { }
                 }
                 else {
                     # 点一下 / 摸头:随机挑一个动作(上半部分算摸头)
