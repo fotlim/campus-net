@@ -103,7 +103,7 @@ $VbsFile    = Join-Path $WorkDir 'run-hidden.vbs'
 $TaskName   = 'CampusNet-AutoLogin'
 $RepairTaskName = 'CampusNet-Repair'
 $UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-$script:AppVersion = '1.2.3'
+$script:AppVersion = '1.2.4'
 $Curl = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
 $script:NicList = $null
 $script:NicListAt = [datetime]::MinValue
@@ -141,6 +141,11 @@ function Get-Settings {
         petSayDur       = 0
         petOverlayFont  = 9.5
         petOverlayOpacity = 0.94
+        iconPlay        = $true
+        iconAuto        = $true
+        iconWander      = $false
+        iconEatSec      = 180
+        iconReady       = $false
     }
     if (-not (Test-Path $SettingsFn)) { return $def }
     try {
@@ -175,6 +180,11 @@ function Get-Settings {
         if (-not $s.PSObject.Properties['petSayDur']) { $s | Add-Member -NotePropertyName petSayDur -NotePropertyValue 0 -Force }
         if (-not $s.PSObject.Properties['petOverlayFont'] -or [double]$s.petOverlayFont -le 0) { $s | Add-Member -NotePropertyName petOverlayFont -NotePropertyValue 9.5 -Force }
         if (-not $s.PSObject.Properties['petOverlayOpacity'] -or [double]$s.petOverlayOpacity -le 0) { $s | Add-Member -NotePropertyName petOverlayOpacity -NotePropertyValue 0.94 -Force }
+        if (-not $s.PSObject.Properties['iconPlay']) { $s | Add-Member -NotePropertyName iconPlay -NotePropertyValue $true -Force }
+        if (-not $s.PSObject.Properties['iconAuto']) { $s | Add-Member -NotePropertyName iconAuto -NotePropertyValue $true -Force }
+        if (-not $s.PSObject.Properties['iconWander']) { $s | Add-Member -NotePropertyName iconWander -NotePropertyValue $false -Force }
+        if (-not $s.PSObject.Properties['iconEatSec']) { $s | Add-Member -NotePropertyName iconEatSec -NotePropertyValue 180 -Force }
+        if (-not $s.PSObject.Properties['iconReady']) { $s | Add-Member -NotePropertyName iconReady -NotePropertyValue $false -Force }
         return $s
     } catch { return $def }
 }
@@ -212,6 +222,11 @@ function Save-Settings {
         petSayDur       = [double]$(if ($null -ne $Settings.petSayDur) { $Settings.petSayDur } else { 0 })
         petOverlayFont  = [double]$(if ($Settings.petOverlayFont) { $Settings.petOverlayFont } else { 9.5 })
         petOverlayOpacity = [double]$(if ($Settings.petOverlayOpacity) { $Settings.petOverlayOpacity } else { 0.94 })
+        iconPlay        = [bool]$(if ($null -ne $Settings.iconPlay) { $Settings.iconPlay } else { $true })
+        iconAuto        = [bool]$(if ($null -ne $Settings.iconAuto) { $Settings.iconAuto } else { $true })
+        iconWander      = [bool]$(if ($null -ne $Settings.iconWander) { $Settings.iconWander } else { $false })
+        iconEatSec      = [int]$(if ($Settings.iconEatSec) { $Settings.iconEatSec } else { 180 })
+        iconReady       = [bool]$(if ($null -ne $Settings.iconReady) { $Settings.iconReady } else { $false })
     } | ConvertTo-Json | Set-Content -Path $SettingsFn -Encoding UTF8
 }
 
@@ -2751,6 +2766,21 @@ $script:PetSleepCache = $false
 $script:PetSleepAt = [datetime]::MinValue
 $script:PetSleepHits = 0
 $script:PetStateStamp = 0
+# 桌面图标互动(吃掉 / 搬运 / 整理)
+$script:IconDir = $WorkDir
+$script:IconLv = [IntPtr]::Zero
+$script:IconEaten = @()
+$script:IconPlay = $true
+$script:IconAutoWander = $false
+$script:IconEatSeconds = 180
+$script:IconReady = $false
+$script:IconEventAt = [datetime]::MinValue
+$script:IconLayoutFn = Join-Path $script:IconDir 'icon-layout.json'
+$script:IconStateFn = Join-Path $script:IconDir 'icon-state.json'
+$script:ScreenW = 0
+$script:ScreenH = 0
+$script:PetFrameW = 1
+$script:PetFrameH = 1
 $script:PetOverlayFontSize = 9.5
 $script:PetOverlayLineH = 22
 $script:PetOverlayPad = 10
@@ -3175,7 +3205,7 @@ function Get-PetFrames {
     $k = 1
     # 长动作(整段 10 秒、上百帧)也插帧,否则 12fps 素材看着一顿一顿的;
     # 但 idle/sleep/walk 是慢速循环,不插(省内存)
-    $interpOk = (($files.Count -le 90) -or ($Anim -notin @('idle', 'sleep', 'walk')))
+    $interpOk = (($fps -lt 20) -and (($files.Count -le 90) -or ($Anim -notin @('idle', 'sleep', 'walk'))))
     if ($targetFps -gt [int]($fps * 1.2) -and $interpOk) { $k = 2 }
     # 内存闸门:一个动作最多 300 帧(约 80MB),再高就不插了
     if (($files.Count * $k) -gt 300) {
@@ -4124,6 +4154,7 @@ function Update-PetOverlayPosition {
     $w = $script:PetOverlay.ClientSize.Width
     $h = $script:PetOverlay.ClientSize.Height
     $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    $script:ScreenW = $wa.Right; $script:ScreenH = $wa.Bottom
     $x = $script:PetX + 10
     $y = $script:PetY - $h - 6
     if ($y -lt $wa.Top) { $y = $script:PetY + 210 + 6 }
@@ -4200,6 +4231,7 @@ function Play-PetAction {
 
 function Start-PetWander {
     $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    $script:ScreenW = $wa.Right; $script:ScreenH = $wa.Bottom
     $tx = $script:PetXf + (Get-Random -Minimum -260 -Maximum 260)
     $ty = $script:PetYf + (Get-Random -Minimum -140 -Maximum 140)
     $tx = [Math]::Max($wa.Left + 10, [Math]::Min($wa.Right - 190, $tx))
@@ -4217,6 +4249,7 @@ function Step-PetWander {
         $script:PetYf = $script:PetTarget.Y
         $script:PetTarget = $null
         $script:PetStillSince = Get-Date
+        try { [void](Invoke-IconEventNearPet -Source 'wander' -Chance 60) } catch { }
         return
     }
     # 浮点累加,每秒约 96px;取整只在绘制时做,不会有整数截断造成的抖动
@@ -4256,6 +4289,7 @@ function Step-PetPhysics {
     $script:PetYf = $script:PetYf + $script:PetVy * $Dt
 
     $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    $script:ScreenW = $wa.Right; $script:ScreenH = $wa.Bottom
     $pw = $script:PetForm.ClientSize.Width
     $ph = $script:PetForm.ClientSize.Height
     $minX = $wa.Left
@@ -4486,6 +4520,535 @@ function Save-PetPos {
     } catch { }
 }
 
+# ================= 桌面图标互动(吃掉 / 搬运 / 整理) =================
+# 直接读写桌面 SysListView32 的图标位置(LVM_GETITEMPOSITION / LVM_SETITEMPOSITION),
+# 跨进程要用 VirtualAllocEx + Read/WriteProcessMemory。
+# 「自动排列图标」开着时位置会被 shell 弹回,所以动手前先测一下能不能挪:
+# 挪不动就写注册表关掉它(FFlags bit0)并重启一次资源管理器 —— Windows 只认这一条路。
+$script:DeskIconsCs = @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+
+namespace DeskPet {
+    public static class DeskIcons {
+        const int LVM_FIRST = 0x1000;
+        const int LVM_GETITEMCOUNT = LVM_FIRST + 4;
+        const int LVM_SETITEMPOSITION = LVM_FIRST + 15;
+        const int LVM_GETITEMPOSITION = LVM_FIRST + 16;
+        const int LVM_GETITEMSPACING = LVM_FIRST + 51;
+        const int LVM_GETITEMTEXTW = LVM_FIRST + 115;
+        const uint LVIF_TEXT = 0x1;
+        const int PROCESS_VM_OPERATION = 0x8, PROCESS_VM_READ = 0x10, PROCESS_VM_WRITE = 0x20, PROCESS_QUERY_INFORMATION = 0x400;
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct LVITEM {
+            public uint mask; public int iItem; public int iSubItem; public uint state; public uint stateMask;
+            public IntPtr pszText; public int cchTextMax; public int iImage; public IntPtr lParam;
+            public int iIndent; public int iGroupId; public uint cColumns; public IntPtr puColumns; public IntPtr piColFmt; public int iGroup;
+        }
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindow(string cls, string title);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string cls, string title);
+        [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
+        [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+        [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(int access, bool inherit, uint pid);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr VirtualAllocEx(IntPtr h, IntPtr addr, IntPtr size, int type, int protect);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern bool VirtualFreeEx(IntPtr h, IntPtr addr, IntPtr size, int type);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern bool WriteProcessMemory(IntPtr h, IntPtr addr, byte[] buf, IntPtr size, out IntPtr written);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern bool ReadProcessMemory(IntPtr h, IntPtr addr, byte[] buf, IntPtr size, out IntPtr read);
+        [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+
+        public static IntPtr DefView = IntPtr.Zero;
+        public static IntPtr ListView = IntPtr.Zero;
+
+        public static IntPtr Find() {
+            IntPtr progman = FindWindow("Progman", null);
+            IntPtr dv = FindWindowEx(progman, IntPtr.Zero, "SHELLDLL_DefView", null);
+            if (dv == IntPtr.Zero) {
+                IntPtr w = IntPtr.Zero;
+                while ((w = FindWindowEx(IntPtr.Zero, w, "WorkerW", null)) != IntPtr.Zero) {
+                    dv = FindWindowEx(w, IntPtr.Zero, "SHELLDLL_DefView", null);
+                    if (dv != IntPtr.Zero) break;
+                }
+            }
+            DefView = dv;
+            ListView = dv == IntPtr.Zero ? IntPtr.Zero : FindWindowEx(dv, IntPtr.Zero, "SysListView32", null);
+            return ListView;
+        }
+
+        public static int Count(IntPtr lv) { return (int)SendMessage(lv, LVM_GETITEMCOUNT, IntPtr.Zero, IntPtr.Zero); }
+
+        public static int[] Spacing(IntPtr lv) {
+            long v = SendMessage(lv, LVM_GETITEMSPACING, IntPtr.Zero, IntPtr.Zero).ToInt64();
+            return new int[] { (int)(v & 0xFFFF), (int)((v >> 16) & 0xFFFF) };
+        }
+
+        static IntPtr OpenFor(IntPtr hwnd, out IntPtr proc) {
+            uint pid; GetWindowThreadProcessId(hwnd, out pid);
+            proc = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION, false, pid);
+            return proc;
+        }
+
+        public static int[] Pos(IntPtr lv, int index) {
+            IntPtr proc; OpenFor(lv, out proc);
+            if (proc == IntPtr.Zero) return null;
+            IntPtr mem = VirtualAllocEx(proc, IntPtr.Zero, (IntPtr)16, 0x3000, 0x04);
+            if (mem == IntPtr.Zero) { CloseHandle(proc); return null; }
+            try {
+                SendMessage(lv, LVM_GETITEMPOSITION, (IntPtr)index, mem);
+                byte[] buf = new byte[8]; IntPtr read;
+                if (!ReadProcessMemory(proc, mem, buf, (IntPtr)8, out read)) return null;
+                return new int[] { BitConverter.ToInt32(buf, 0), BitConverter.ToInt32(buf, 4) };
+            } finally { VirtualFreeEx(proc, mem, IntPtr.Zero, 0x8000); CloseHandle(proc); }
+        }
+
+        public static void SetPos(IntPtr lv, int index, int x, int y) {
+            // 不夹到屏幕内:吃掉图标要挪到可视区外;但 16 位消息只能表示 0..65535
+            if (x < 0) x = 0;
+            if (y < 0) y = 0;
+            if (x > 30000) x = 30000;
+            if (y > 30000) y = 30000;
+            SendMessage(lv, LVM_SETITEMPOSITION, (IntPtr)index, (IntPtr)((y << 16) | (x & 0xFFFF)));
+        }
+
+        public static string Text(IntPtr lv, int index) {
+            IntPtr proc; OpenFor(lv, out proc);
+            if (proc == IntPtr.Zero) return "";
+            IntPtr mem = VirtualAllocEx(proc, IntPtr.Zero, (IntPtr)4096, 0x3000, 0x04);
+            if (mem == IntPtr.Zero) { CloseHandle(proc); return ""; }
+            try {
+                IntPtr itemPtr = mem;
+                IntPtr textPtr = (IntPtr)(mem.ToInt64() + 1024);
+                LVITEM it = new LVITEM();
+                it.mask = LVIF_TEXT; it.iItem = index; it.iSubItem = 0;
+                it.pszText = textPtr; it.cchTextMax = 512;
+                int size = Marshal.SizeOf(typeof(LVITEM));
+                IntPtr tmp = Marshal.AllocHGlobal(size);
+                byte[] raw;
+                try { Marshal.StructureToPtr(it, tmp, false); raw = new byte[size]; Marshal.Copy(tmp, raw, 0, size); }
+                finally { Marshal.FreeHGlobal(tmp); }
+                IntPtr written;
+                WriteProcessMemory(proc, itemPtr, raw, (IntPtr)raw.Length, out written);
+                SendMessage(lv, LVM_GETITEMTEXTW, (IntPtr)index, itemPtr);
+                byte[] buf = new byte[1024]; IntPtr read;
+                ReadProcessMemory(proc, textPtr, buf, (IntPtr)1024, out read);
+                string s = Encoding.Unicode.GetString(buf);
+                int z = s.IndexOf('\0');
+                return z >= 0 ? s.Substring(0, z) : s;
+            } finally { VirtualFreeEx(proc, mem, IntPtr.Zero, 0x8000); CloseHandle(proc); }
+        }
+    }
+}
+'@
+
+function Initialize-DeskIcons {
+    if (-not ('DeskPet.DeskIcons' -as [type])) {
+        Add-Type -TypeDefinition $script:DeskIconsCs -Language CSharp
+    }
+    $lv = [DeskPet.DeskIcons]::ListView
+    # 资源管理器重启过之后句柄会失效,得重新找
+    if ($lv -eq [IntPtr]::Zero -or -not [DeskPet.DeskIcons]::IsWindow($lv)) { $lv = [DeskPet.DeskIcons]::Find() }
+    $script:IconLv = $lv
+    return $lv
+}
+
+function Get-DesktopIconList {
+    # 返回 @{ Lv; Spacing; Icons = @(@{Index;Name;X;Y;W;H}) };拿不到桌面就返回 $null
+    $lv = Initialize-DeskIcons
+    if (-not $lv -or $lv -eq [IntPtr]::Zero) { return $null }
+    $sp = [DeskPet.DeskIcons]::Spacing($lv)
+    if (-not $sp -or $sp[0] -le 0 -or $sp[1] -le 0) { $sp = @(90, 100) }
+    $n = [DeskPet.DeskIcons]::Count($lv)
+    if ($n -le 0) { return $null }
+    $list = New-Object System.Collections.ArrayList
+    for ($i = 0; $i -lt $n; $i++) {
+        $pos = [DeskPet.DeskIcons]::Pos($lv, $i)
+        if (-not $pos) { continue }
+        $name = ''
+        try { $name = [DeskPet.DeskIcons]::Text($lv, $i) } catch { }
+        [void]$list.Add([pscustomobject]@{
+                Index = $i; Name = $name; X = [int]$pos[0]; Y = [int]$pos[1]
+                W = [int]$sp[0]; H = [int]$sp[1]
+            })
+    }
+    if ($list.Count -eq 0) { return $null }
+    return [pscustomobject]@{ Lv = $lv; Spacing = $sp; Icons = @($list) }
+}
+
+function Get-DesktopIconAt {
+    param([int]$X, [int]$Y)
+    $d = Get-DesktopIconList
+    if (-not $d) { return $null }
+    foreach ($ic in $d.Icons) {
+        if ($X -ge $ic.X -and $X -lt ($ic.X + $ic.W) -and $Y -ge $ic.Y -and $Y -lt ($ic.Y + $ic.H)) {
+            return [pscustomobject]@{ Icon = $ic; Data = $d }
+        }
+    }
+    return $null
+}
+
+function Get-DesktopIconNearPet {
+    # 宠物盖住的图标:先看中心点,再看矩形重叠
+    $px = [int]($script:PetX + ($script:PetFrameW / 2))
+    $py = [int]($script:PetY + ($script:PetFrameH / 2))
+    $hit = Get-DesktopIconAt -X $px -Y $py
+    if ($hit) { return $hit }
+    $d = Get-DesktopIconList
+    if (-not $d) { return $null }
+    $x0 = [int]$script:PetX; $y0 = [int]$script:PetY
+    $x1 = $x0 + [int]$script:PetFrameW; $y1 = $y0 + [int]$script:PetFrameH
+    foreach ($ic in $d.Icons) {
+        $ox = [Math]::Max($x0, $ic.X); $oy = [Math]::Max($y0, $ic.Y)
+        $ex = [Math]::Min($x1, $ic.X + $ic.W); $ey = [Math]::Min($y1, $ic.Y + $ic.H)
+        if ($ex - $ox -gt 12 -and $ey - $oy -gt 12) { return [pscustomobject]@{ Icon = $ic; Data = $d } }
+    }
+    return $null
+}
+
+function Test-IconMovable {
+    # 试挪一个图标:只要位置变了就算能挪(桌面开着「对齐到网格」时坐标会被吸附,
+    # 所以不能按精确坐标比,不然会误判成「挪不动」,白白重启一次资源管理器)
+    param($Data)
+    if (-not $Data -or $Data.Icons.Count -eq 0) { return $false }
+    $p = $Data.Icons[0]
+    $bx = [int]$p.X; $by = [int]$p.Y
+    $tx = $bx + [Math]::Max(40, [int]$Data.Spacing[0])
+    $ty = $by + [int]$Data.Spacing[1]
+    [DeskPet.DeskIcons]::SetPos($Data.Lv, $p.Index, $tx, $ty)
+    Start-Sleep -Milliseconds 300
+    $after = [DeskPet.DeskIcons]::Pos($Data.Lv, $p.Index)
+    $moved = ($after -and ([Math]::Abs($after[0] - $bx) -gt 12 -or [Math]::Abs($after[1] - $by) -gt 12))
+    [DeskPet.DeskIcons]::SetPos($Data.Lv, $p.Index, $bx, $by)
+    Start-Sleep -Milliseconds 150
+    return $moved
+}
+
+function ConvertTo-IconGrid {
+    # 把坐标吸附到图标网格(桌面开着「对齐到网格」时,不吸附就落不到你给的点上)
+    param([int]$X, [int]$Y, [int]$Cw, [int]$Ch)
+    if ($Cw -lt 20) { $Cw = 90 }
+    if ($Ch -lt 20) { $Ch = 100 }
+    $gx = [int][Math]::Round($X / $Cw) * $Cw
+    $gy = [int][Math]::Round($Y / $Ch) * $Ch
+    if ($gx -lt 0) { $gx = 0 }
+    if ($gy -lt 0) { $gy = 0 }
+    return @($gx, $gy)
+}
+function Enable-DesktopAutoArrangeOff {
+    # 关掉「自动排列图标」:Windows 只认注册表里的 FFlags bit0,而且**必须重启一次资源管理器**才生效
+    # (正在跑的 explorer 不会重读这个键,所以哪怕键里已经是关的,也得重启)。
+    # 第一次问一句(任务栏会闪一下),之后记住不再问。
+    param([switch]$Force, [switch]$NoDialog)
+    $key = 'HKCU:\Software\Microsoft\Windows\Shell\Bags\1\Desktop'
+    $flags = 0x40200225
+    try { $flags = [int](Get-ItemProperty -Path $key -ErrorAction Stop).FFlags } catch { }
+    if (-not [bool]$script:IconReady -and -not $NoDialog) {
+        try {
+            Add-Type -AssemblyName System.Windows.Forms
+            $ans = [System.Windows.Forms.MessageBox]::Show(
+                '桌面的「自动排列图标」现在是开着的,吃掉/搬运/整理图标都动不了。' + "`r`n`r`n" +
+                '要关掉它吗?会重启一次资源管理器(任务栏闪一下,打开的文件夹窗口会关掉),图标位置保留。',
+                '桌面宠物', 'YesNo', 'Question')
+            if ($ans -ne 'Yes') { Write-Log '没关自动排列:图标互动这次跳过' 'WARN'; return $false }
+        } catch { }
+    }
+    if (($flags -band 1) -ne 0) {
+        try {
+            Set-ItemProperty -Path $key -Name FFlags -Value ([int]($flags -band (-bnot 1))) -Type DWord
+            Write-Log ('已把「自动排列图标」写为关闭(FFlags 0x{0:X8} → 0x{1:X8})' -f $flags, ($flags -band (-bnot 1))) 'WARN'
+        } catch {
+            Write-Log ('改注册表失败:' + $_.Exception.Message) 'WARN'
+            return $false
+        }
+    } else {
+        Write-Log '注册表里「自动排列图标」已经是关的,重启一次资源管理器让它生效' 'WARN'
+    }
+    try {
+        if (Get-Process explorer -ErrorAction SilentlyContinue) { Stop-Process -Name explorer -Force -ErrorAction Stop }
+        else { Start-Process explorer.exe }
+    } catch { Write-Log ('重启资源管理器失败:' + $_.Exception.Message) 'WARN' }
+    for ($i = 0; $i -lt 24; $i++) {
+        Start-Sleep -Milliseconds 500
+        [DeskPet.DeskIcons]::ListView = [IntPtr]::Zero
+        $lv = [DeskPet.DeskIcons]::Find()
+        if ($lv -ne [IntPtr]::Zero) {
+            $d2 = Get-DesktopIconList
+            if ($d2 -and (Test-IconMovable -Data $d2)) {
+                $script:IconReady = $true
+                try { $sI = Get-Settings; $sI.iconReady = $true; [void](Save-Settings -Settings $sI) } catch { }
+                Write-Log '「自动排列图标」已关闭,图标互动生效' 'OK'
+                return $true
+            }
+        }
+    }
+    Write-Log '资源管理器重启了,但图标还是挪不动(可能被别的桌面工具接管了)' 'WARN'
+    return $false
+}
+function Set-DesktopAutoArrangeOff {
+    # 能挪动 → 自动排列本来就关着;挪不动 → 走注册表 + 重启资源管理器
+    # (刚操作完桌面时 shell 可能还没排完,测两次再下结论,免得白重启一次 explorer)
+    param($Data)
+    if (-not $Data -or $Data.Icons.Count -eq 0) { return $false }
+    for ($i = 0; $i -lt 3; $i++) {
+        if (Test-IconMovable -Data $Data) { return $true }
+        Start-Sleep -Milliseconds 250
+        $Data = Get-DesktopIconList
+        if (-not $Data) { return $false }
+    }
+    return (Enable-DesktopAutoArrangeOff)
+}
+function Get-DesktopFileMap {
+    # 图标名 → 文件对象(拿时间和大小用);扩展名可能被隐藏,基名也进表
+    $map = @{}
+    $roots = @([Environment]::GetFolderPath('Desktop'), (Join-Path $env:PUBLIC 'Desktop'))
+    foreach ($root in $roots) {
+        if (-not $root -or -not (Test-Path $root)) { continue }
+        foreach ($f in (Get-ChildItem -LiteralPath $root -Force -ErrorAction SilentlyContinue)) {
+            if (-not $map.ContainsKey($f.Name)) { $map[$f.Name] = $f }
+            if ($f.BaseName -and -not $map.ContainsKey($f.BaseName)) { $map[$f.BaseName] = $f }
+        }
+    }
+    return $map
+}
+
+function Save-DesktopIconLayout {
+    param($Data, [string]$Tag = 'backup')
+    if (-not $Data) { return }
+    try {
+        $rows = @($Data.Icons | ForEach-Object { [pscustomobject]@{ Name = $_.Name; X = $_.X; Y = $_.Y } })
+        [System.IO.File]::WriteAllText($script:IconLayoutFn, ($rows | ConvertTo-Json -Depth 4), (New-Object System.Text.UTF8Encoding($false)))
+        Write-Log ('已记下桌面图标布局(' + $rows.Count + ' 个,' + $Tag + ')')
+    } catch { }
+}
+
+function Read-IconLayoutFile {
+    $rows = @()
+    if (-not (Test-Path $script:IconLayoutFn)) { return $rows }
+    $raw = ''
+    try { $raw = [System.IO.File]::ReadAllText($script:IconLayoutFn, [System.Text.Encoding]::UTF8) } catch { return $rows }
+    $parsed = $null
+    try { if ($raw) { $parsed = $raw | ConvertFrom-Json } } catch { }
+    if ($null -eq $parsed) { return $rows }
+    if ($parsed -is [System.Array]) { return @($parsed) }
+    return @($parsed)
+}
+
+function Restore-DesktopIconLayout {
+    $d = Get-DesktopIconList
+    if (-not $d) { Write-Log '读不到桌面图标,没法恢复布局' 'WARN'; return $false }
+    $rows = @(Read-IconLayoutFile)
+    if ($rows.Count -eq 0) { Write-Log '没有可恢复的布局记录' 'WARN'; return $false }
+    [void](Set-DesktopAutoArrangeOff -Data $d)
+    $d = Get-DesktopIconList
+    if (-not $d) { return $false }
+    $apply = {
+        param($Data)
+        $n = 0
+        foreach ($r in $rows) {
+            $t = @($Data.Icons | Where-Object { [string]$_.Name -eq [string]$r.Name })[0]
+            if ($t) { [DeskPet.DeskIcons]::SetPos($Data.Lv, $t.Index, [int]$r.X, [int]$r.Y); $n++ }
+        }
+        return $n
+    }
+    $n = & $apply $d
+    Start-Sleep -Milliseconds 400
+    # 校验一遍:没对齐的再补一次(shell 偶尔会把刚设的位置弹回去)
+    $d2 = Get-DesktopIconList
+    if ($d2) {
+        $bad = 0
+        foreach ($r in $rows) {
+            $t = @($d2.Icons | Where-Object { [string]$_.Name -eq [string]$r.Name })[0]
+            if ($t -and ([Math]::Abs($t.X - [int]$r.X) -gt 3 -or [Math]::Abs($t.Y - [int]$r.Y) -gt 3)) { $bad++ }
+        }
+        if ($bad -gt 0) {
+            Write-Log ('有 ' + $bad + ' 个图标没对齐,再补一次') 'WARN'
+            [void](& $apply $d2)
+        }
+    }
+    Write-Log ('已恢复桌面图标布局(' + $n + ' / ' + $rows.Count + ' 个)') 'OK'
+    return ($n -gt 0)
+}
+function Save-IconState {
+    try {
+        $obj = [pscustomobject]@{
+            eaten = @($script:IconEaten | ForEach-Object { [pscustomobject]@{ Name = $_.Name; X = $_.X; Y = $_.Y; Due = $_.Due } })
+        }
+        [System.IO.File]::WriteAllText($script:IconStateFn, ($obj | ConvertTo-Json -Depth 4), (New-Object System.Text.UTF8Encoding($false)))
+    } catch { }
+}
+
+function Import-IconState {
+    $script:IconEaten = @()
+    if (-not (Test-Path $script:IconStateFn)) { return }
+    try {
+        $j = [System.IO.File]::ReadAllText($script:IconStateFn, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+        if ($j -and $j.eaten) { $script:IconEaten = @($j.eaten) }
+    } catch { }
+}
+
+function Restore-EatenIcons {
+    # 到点的(或被要求全部)把图标搬回原位;按名字找,图标索引可能变了
+    param([switch]$All)
+    if (-not $script:IconEaten -or $script:IconEaten.Count -eq 0) { return 0 }
+    $d = Get-DesktopIconList
+    if (-not $d) { return 0 }
+    $now = Get-Date
+    $keep = New-Object System.Collections.ArrayList
+    $restored = 0
+    foreach ($e in $script:IconEaten) {
+        $due = [datetime]::MinValue
+        try { $due = [datetime]::ParseExact([string]$e.Due, 'yyyy-MM-dd HH:mm:ss', $null) } catch { }
+        if ($All -or ($due -ne [datetime]::MinValue -and $now -ge $due)) {
+            $t = @($d.Icons | Where-Object { [string]$_.Name -eq [string]$e.Name })[0]
+            if ($t) {
+                [DeskPet.DeskIcons]::SetPos($d.Lv, $t.Index, [int]$e.X, [int]$e.Y)
+                $restored++
+                Write-Log ('图标已恢复:' + $e.Name) 'OK'
+            }
+        } else {
+            [void]$keep.Add($e)
+        }
+    }
+    $script:IconEaten = @($keep)
+    Save-IconState
+    return $restored
+}
+
+function Invoke-IconEat {
+    # 吃掉 = 挪到屏幕外,到点(默认 180 秒)自己搬回来
+    param($Icon, $Data)
+    if (-not $Icon) { return $false }
+    $d = Get-DesktopIconList
+    if (-not $d) { return $false }
+    if (-not (Set-DesktopAutoArrangeOff -Data $d)) { return $false }
+    $d = Get-DesktopIconList
+    if (-not $d) { return $false }
+    $t = @($d.Icons | Where-Object { [string]$_.Name -eq [string]$Icon.Name })[0]
+    if (-not $t) { return $false }
+    $due = (Get-Date).AddSeconds([int]$script:IconEatSeconds)
+    $script:IconEaten += [pscustomobject]@{ Name = $t.Name; X = [int]$t.X; Y = [int]$t.Y; Due = $due.ToString('yyyy-MM-dd HH:mm:ss'); Index = [int]$t.Index }
+    Save-IconState
+    # 屏幕外:先按网格推到右下角外面,ListView 一刷新就看不见了,但还在列表里
+    $off = ConvertTo-IconGrid -X ($script:ScreenW + 4000) -Y ($script:ScreenH + 4000) -Cw ([int]$d.Spacing[0]) -Ch ([int]$d.Spacing[1])
+    [DeskPet.DeskIcons]::SetPos($d.Lv, $t.Index, $off[0], $off[1])
+    Write-Log ('图标互动:吃掉「' + $t.Name + '」,' + [int]$script:IconEatSeconds + ' 秒后回原位') 'OK'
+    try { Show-PetSaying } catch { }
+    return $true
+}
+function Invoke-IconCarry {
+    # 搬运 = 关掉自动排列,把图标丢到一个随机位置(吸附到网格)
+    param($Icon, $Data)
+    if (-not $Icon) { return $false }
+    $d = Get-DesktopIconList
+    if (-not $d) { return $false }
+    if (-not (Set-DesktopAutoArrangeOff -Data $d)) { return $false }
+    $d = Get-DesktopIconList
+    if (-not $d) { return $false }
+    $t = @($d.Icons | Where-Object { [string]$_.Name -eq [string]$Icon.Name })[0]
+    if (-not $t) { return $false }
+    $cw = [int]$d.Spacing[0]; $ch = [int]$d.Spacing[1]
+    $cols = [Math]::Max(1, [int][Math]::Floor($script:ScreenW / $cw))
+    $rows = [Math]::Max(1, [int][Math]::Floor($script:ScreenH / $ch))
+    $gx = (Get-Random -Minimum 0 -Maximum $cols) * $cw
+    $gy = (Get-Random -Minimum 0 -Maximum $rows) * $ch
+    [DeskPet.DeskIcons]::SetPos($d.Lv, $t.Index, $gx, $gy)
+    Write-Log ('图标互动:把「' + $t.Name + '」搬到 (' + $gx + ',' + $gy + ')') 'OK'
+    try { Show-PetSaying } catch { }
+    return $true
+}
+function Invoke-IconTidy {
+    # 整理 = 随机挑一种排法,按格子重排所有图标
+    param($Data)
+    $d = Get-DesktopIconList
+    if (-not $d -or $d.Icons.Count -lt 2) { return $false }
+    if (-not (Set-DesktopAutoArrangeOff -Data $d)) { return $false }
+    $d = Get-DesktopIconList
+    if (-not $d) { return $false }
+    $fileMap = Get-DesktopFileMap
+    $rows = foreach ($ic in $d.Icons) {
+        $f = $fileMap[[string]$ic.Name]
+        if (-not $f) { $base = [System.IO.Path]::GetFileNameWithoutExtension([string]$ic.Name); if ($base) { $f = $fileMap[$base] } }
+        [pscustomobject]@{
+            Index = $ic.Index; Name = $ic.Name
+            Time  = $(if ($f) { $f.LastWriteTime } else { [datetime]::MinValue })
+            Size  = $(if ($f) { $f.Length } else { 0 })
+        }
+    }
+    $rows = @($rows)
+    $methods = @('名称正序', '名称倒序', '时间正序', '时间倒序', '大小正序', '大小倒序')
+    $method = $methods[(Get-Random -Maximum $methods.Count)]
+    switch ($method) {
+        '名称正序' { $rows = @($rows | Sort-Object Name) }
+        '名称倒序' { $rows = @($rows | Sort-Object Name -Descending) }
+        '时间正序' { $rows = @($rows | Sort-Object Time, Name) }
+        '时间倒序' { $rows = @($rows | Sort-Object Time -Descending) }
+        '大小正序' { $rows = @($rows | Sort-Object Size, Name) }
+        '大小倒序' { $rows = @($rows | Sort-Object Size -Descending) }
+    }
+    $cw = [int]$d.Spacing[0]; $ch = [int]$d.Spacing[1]
+    $margin = 8
+    $cols = [Math]::Max(1, [int][Math]::Floor(($script:ScreenW - $margin) / $cw))
+    for ($i = 0; $i -lt $rows.Count; $i++) {
+        $col = $i % $cols
+        $row = [int][Math]::Floor($i / $cols)
+        $x = $margin + $col * $cw
+        $y = $margin + $row * $ch
+        if ($y -gt ($script:ScreenH - $ch)) { break }
+        [DeskPet.DeskIcons]::SetPos($d.Lv, $rows[$i].Index, $x, $y)
+    }
+    Write-Log ('图标互动:整理 ' + $rows.Count + ' 个图标,排法「' + $method + '」') 'OK'
+    try { Show-PetSaying } catch { }
+    return $true
+}
+
+function Invoke-IconManual {
+    # 菜单里手动触发:默认对「宠物下面那个图标」动手;整理则对全部图标
+    param([string]$Kind)
+    $hit = Get-DesktopIconNearPet
+    if (-not $hit -and $Kind -ne 'tidy') {
+        Write-Log '宠物下面没有图标 —— 先把它拖到桌面图标上再点' 'WARN'
+        return $false
+    }
+    if (-not $hit) {
+        $d = Get-DesktopIconList
+        if (-not $d) { Write-Log '读不到桌面图标列表' 'WARN'; return $false }
+        $hit = [pscustomobject]@{ Icon = $d.Icons[0]; Data = $d }
+    }
+    [void](Save-DesktopIconLayout -Data $hit.Data -Tag 'manual')
+    switch ($Kind) {
+        'eat' { return (Invoke-IconEat -Icon $hit.Icon -Data $hit.Data) }
+        'carry' { return (Invoke-IconCarry -Icon $hit.Icon -Data $hit.Data) }
+        'tidy' { return (Invoke-IconTidy -Data $hit.Data) }
+        'restore' { return ([bool](Restore-DesktopIconLayout)) }
+        'all' { return ((Restore-EatenIcons -All) -gt 0) }
+    }
+    return $false
+}
+
+function Invoke-IconEventNearPet {
+    # 宠物停在图标上时随机来一个事件;带冷却,避免一直折腾桌面
+    param([string]$Source = 'drop', [int]$Chance = 100)
+    if (-not [bool]$script:IconPlay) { return $false }
+    $now = Get-Date
+    if ($script:IconEventAt -ne [datetime]::MinValue -and ($now - $script:IconEventAt).TotalSeconds -lt 45) { return $false }
+    if ($Source -eq 'wander' -and -not [bool]$script:IconAutoWander) { return $false }
+    if ((Get-Random -Maximum 100) -ge $Chance) { return $false }
+    $hit = Get-DesktopIconNearPet
+    if (-not $hit) { return $false }
+    [void](Save-DesktopIconLayout -Data $hit.Data -Tag 'touch')
+    $script:IconEventAt = $now
+    $pick = @('eat', 'carry', 'tidy')[(Get-Random -Maximum 3)]
+    $ok = $false
+    switch ($pick) {
+        'eat' { $ok = Invoke-IconEat -Icon $hit.Icon -Data $hit.Data }
+        'carry' { $ok = Invoke-IconCarry -Icon $hit.Icon -Data $hit.Data }
+        'tidy' { $ok = Invoke-IconTidy -Data $hit.Data }
+    }
+    return $ok
+}
+
 # ---------- 宠物菜单的勾选:菜单只建一次,勾必须能跟着设置重算 ----------
 # 以前是「建菜单时算一次」,所以把帧率改成 48Hz 再打开菜单,勾还停在 60Hz 上。
 function Set-PetMenuCheck {
@@ -4582,6 +5145,52 @@ function New-PetMenu {
     $miModel.Text = '模型'
     Add-PetModelItems -Parent $miModel -Snapshot $snap
     [void]$menu.Items.Add($miModel)
+    $miIcons = New-Object System.Windows.Forms.ToolStripMenuItem
+    $miIcons.Text = '桌面图标互动'
+    $miIconEat = New-Object System.Windows.Forms.ToolStripMenuItem
+    $miIconEat.Text = '吃掉一个图标(3 分钟后回原位)'
+    $miIconEat.add_Click({ try { [void](Invoke-IconManual -Kind 'eat') } catch { } })
+    [void]$miIcons.DropDownItems.Add($miIconEat)
+    $miIconCarry = New-Object System.Windows.Forms.ToolStripMenuItem
+    $miIconCarry.Text = '搬运一个图标(随机位置)'
+    $miIconCarry.add_Click({ try { [void](Invoke-IconManual -Kind 'carry') } catch { } })
+    [void]$miIcons.DropDownItems.Add($miIconCarry)
+    $miIconTidy = New-Object System.Windows.Forms.ToolStripMenuItem
+    $miIconTidy.Text = '整理图标(随机一种排法)'
+    $miIconTidy.add_Click({ try { [void](Invoke-IconManual -Kind 'tidy') } catch { } })
+    [void]$miIcons.DropDownItems.Add($miIconTidy)
+    [void]$miIcons.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+    $miIconAll = New-Object System.Windows.Forms.ToolStripMenuItem
+    $miIconAll.Text = '立即还回被吃掉的图标'
+    $miIconAll.add_Click({ try { [void](Restore-EatenIcons -All) } catch { } })
+    [void]$miIcons.DropDownItems.Add($miIconAll)
+    $miIconLayout = New-Object System.Windows.Forms.ToolStripMenuItem
+    $miIconLayout.Text = '恢复上次记下的图标布局'
+    $miIconLayout.add_Click({ try { [void](Restore-DesktopIconLayout) } catch { } })
+    [void]$miIcons.DropDownItems.Add($miIconLayout)
+    [void]$miIcons.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+    $miIconAuto = New-Object System.Windows.Forms.ToolStripMenuItem
+    $miIconAuto.Text = '拖到图标上自动触发'
+    $miIconAuto.CheckOnClick = $true
+    Set-PetMenuCheck -Item $miIconAuto -Name 'iconAuto' -Value $true -Tol -1 -Snapshot $snap
+    $miIconAuto.add_Click({
+            param($sender, $e)
+            Set-PetSettingValue -Name 'iconAuto' -Value ([bool]$sender.Checked)
+            Write-Log ('图标互动:拖放触发 ' + $(if ($sender.Checked) { '开' } else { '关' }))
+        })
+    [void]$miIcons.DropDownItems.Add($miIconAuto)
+    $miIconWander2 = New-Object System.Windows.Forms.ToolStripMenuItem
+    $miIconWander2.Text = '溜达到图标上也触发'
+    $miIconWander2.CheckOnClick = $true
+    Set-PetMenuCheck -Item $miIconWander2 -Name 'iconWander' -Value $true -Tol -1 -Snapshot $snap
+    $miIconWander2.add_Click({
+            param($sender, $e)
+            Set-PetSettingValue -Name 'iconWander' -Value ([bool]$sender.Checked)
+            $script:IconAutoWander = [bool]$sender.Checked
+            Write-Log ('图标互动:溜达触发 ' + $(if ($sender.Checked) { '开' } else { '关' }))
+        })
+    [void]$miIcons.DropDownItems.Add($miIconWander2)
+    [void]$menu.Items.Add($miIcons)
 
     $miActions = New-Object System.Windows.Forms.ToolStripMenuItem
     $miActions.Text = '动作'
@@ -4991,6 +5600,16 @@ function Start-Pet {
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
     [void](Set-PetDpiAware)
+    # 图标互动:读设置 + 把上次没还回去的图标先还了
+    try {
+        $sI = Get-Settings
+        $script:IconPlay = [bool]$sI.iconPlay
+        $script:IconAutoWander = [bool]$sI.iconWander
+        $script:IconEatSeconds = [int]$sI.iconEatSec
+        $script:IconReady = [bool]$sI.iconReady
+        Import-IconState
+        [void](Restore-EatenIcons)
+    } catch { }
     if (-not ('CampusNetPet.Layered' -as [type])) {
         Add-Type -TypeDefinition $script:LayeredCs -Language CSharp -ReferencedAssemblies System.Drawing
     }
@@ -5002,6 +5621,7 @@ function Start-Pet {
 
     $set = Get-Settings
     $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    $script:ScreenW = $wa.Right; $script:ScreenH = $wa.Bottom
     if ([int]$set.petX -gt 0 -and [int]$set.petY -gt 0) {
         $script:PetX = [int]$set.petX
         $script:PetY = [int]$set.petY
@@ -5104,6 +5724,7 @@ function Start-Pet {
                     # 甩出去:按松手瞬间的速度给一个初速,之后交给重力
                     $speed = [Math]::Sqrt($script:PetDrag.VX * $script:PetDrag.VX + $script:PetDrag.VY * $script:PetDrag.VY)
                     if ($speed -gt 120) { Start-PetPhysics -Vx $script:PetDrag.VX -Vy $script:PetDrag.VY }
+                    try { [void](Invoke-IconEventNearPet -Source 'drop') } catch { }
                 }
                 else {
                     # 点一下 / 摸头:随机挑一个动作(上半部分算摸头)
@@ -5393,6 +6014,16 @@ function Invoke-Tray {
 
     # 先声明 DPI 感知(必须在建窗口之前),否则宠物窗口在高缩放下会被放大并偏移
     [void](Set-PetDpiAware)
+    # 图标互动:读设置 + 把上次没还回去的图标先还了
+    try {
+        $sI = Get-Settings
+        $script:IconPlay = [bool]$sI.iconPlay
+        $script:IconAutoWander = [bool]$sI.iconWander
+        $script:IconEatSeconds = [int]$sI.iconEatSec
+        $script:IconReady = [bool]$sI.iconReady
+        Import-IconState
+        [void](Restore-EatenIcons)
+    } catch { }
 
     # 托盘里的 UI 回调出异常时只记日志,不要直接退出(否则用户看到的是"图标自己没了")
     try {
@@ -5561,6 +6192,7 @@ function Invoke-Tray {
     $itemExit = New-Object System.Windows.Forms.ToolStripMenuItem
     $itemExit.Text = '退出托盘(同时停止守护和桌宠)'
     $itemExit.add_Click({
+            try { [void](Restore-EatenIcons -All) } catch { }
             Stop-Watcher
             Stop-PetProcess
             $script:TrayNotify.Visible = $false
@@ -5614,6 +6246,7 @@ function Invoke-Tray {
                 Update-TrayState
                 Start-WatcherIfNeeded
                 Sync-PetWithSettings
+                Restore-EatenIcons
             } catch { }
         })
     $timer.Start()
