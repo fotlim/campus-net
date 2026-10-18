@@ -1,6 +1,6 @@
 # 校园网自动登录(托盘 + 开机自启 + 多账号 + WiFi + 校时 + 网速 + 一键诊断 + 通知中心 + 唤醒重认证 + 自动修复 + 桌宠)
 
-![version](https://img.shields.io/badge/version-1.2.6-blue)
+![version](https://img.shields.io/badge/version-1.2.7-blue)
 
 **校园网自动认证登录 / WiFi 自动认证登录** —— Windows 装一次,之后开机自动连校园无线网、自动完成 Portal 认证、掉线自动重连。宿舍 WiFi(ChinaNet / CMCC-EDU / 沃 WiFi)、教学楼认证页都适用。
 
@@ -736,6 +736,12 @@ rememberPwd=0
 真要在登录前联网,需要改成 SYSTEM 运行 + `-MachineScope` 机器级加密 —— 需要就说一声。
 
 ## 更新日志
+
+### v1.2.7(2026-10-18)
+
+- **修:动作淡入时那块半透明黑框**。淡入用的位图原来从 HBITMAP 转(GDI+ 丢 alpha → 黑底),
+  两张混起来就是黑框;现在两边都按当前缩放/配色重新解码原 PNG,混合后 alpha 正确,黑框消失
+- 取不到起点帧时不混帧,照常播放
 
 ### v1.2.6(2026-10-18)
 

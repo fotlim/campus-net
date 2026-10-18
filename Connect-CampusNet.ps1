@@ -103,7 +103,7 @@ $VbsFile    = Join-Path $WorkDir 'run-hidden.vbs'
 $TaskName   = 'CampusNet-AutoLogin'
 $RepairTaskName = 'CampusNet-Repair'
 $UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-$script:AppVersion = '1.2.6'
+$script:AppVersion = '1.2.7'
 $Curl = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
 $script:NicList = $null
 $script:NicListAt = [datetime]::MinValue
@@ -2742,6 +2742,8 @@ $script:PetFadeFromBmp = $null
 $script:PetFadeLeft = 0
 $script:PetFadeTotal = 0
 $script:PetLastHb = [IntPtr]::Zero
+$script:PetLastAnim = ''
+$script:PetLastFrameIdx = 0
 $script:PetBuilding = $null
 $script:PetLastIdx = -1
 $script:PetAction = ''
@@ -3089,6 +3091,62 @@ function Apply-PetTint {
     }
 }
 
+function Get-PetFrameBitmap {
+    # 按当前缩放 / 配色 / 画布把某一帧重新解码成**带透明通道**的 Bitmap。
+    # 用途:动作切换的淡入起点。不能拿 HBITMAP 走 Image.FromHbitmap —— GDI+ 会丢掉 alpha,
+    # 透明区域变成黑底,淡入时就出现一个黑框。
+    param([string]$Anim, [int]$Index)
+    if (-not $Anim) { return $null }
+    $dir = Join-Path $script:PetDir $Anim
+    $f = Join-Path $dir ('{0:000}.png' -f [int]$Index)
+    if (-not (Test-Path $f)) {
+        $all = @(Get-ChildItem -LiteralPath $dir -Filter '*.png' -ErrorAction SilentlyContinue | Sort-Object Name)
+        if ($all.Count -eq 0) { return $null }
+        $f = $all[[Math]::Min([int]$Index, $all.Count - 1)].FullName
+    }
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($f)
+        $ms = New-Object System.IO.MemoryStream -ArgumentList (,$bytes)
+        $img = [System.Drawing.Image]::FromStream($ms)
+        $scale = [double](Get-PetCfg).Scale
+        if ($scale -lt 0.5) { $scale = 0.5 }
+        if ($scale -gt 2.0) { $scale = 2.0 }
+        $dw = [Math]::Max(1, [int][Math]::Round($img.Width * $scale))
+        $dh = [Math]::Max(1, [int][Math]::Round($img.Height * $scale))
+        $bmp = New-Object System.Drawing.Bitmap -ArgumentList $dw, $dh, ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+        $g = [System.Drawing.Graphics]::FromImage($bmp)
+        $g.CompositingMode = [System.Drawing.Drawing2D.CompositingMode]::SourceCopy
+        $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+        $g.Clear([System.Drawing.Color]::Transparent)
+        $g.DrawImage($img, 0, 0, $dw, $dh)
+        $g.Dispose(); $img.Dispose(); $ms.Dispose()
+        if ($script:PetTint) { $bmp = Apply-PetTint -Bitmap $bmp -Matrix $script:PetTint }
+        # 垫进统一画布,和播放用的是同一套坐标
+        $man = Get-PetManifest
+        if ($man -and $man.PSObject.Properties['canvas'] -and $man.canvas) {
+            $cw = [int][Math]::Round([double]$man.canvas.w * $scale)
+            $ch = [int][Math]::Round([double]$man.canvas.h * $scale)
+            $ox = 0; $oy = 0
+            foreach ($a in (Get-PetAnimList)) {
+                if ([string]$a.id -eq $Anim) {
+                    if ($a.PSObject.Properties['ox']) { $ox = [int][Math]::Round([double]$a.ox * $scale) }
+                    if ($a.PSObject.Properties['oy']) { $oy = [int][Math]::Round([double]$a.oy * $scale) }
+                    break
+                }
+            }
+            if ($cw -gt 0 -and ($cw -ne $bmp.Width -or $ch -ne $bmp.Height)) {
+                $pad = New-Object System.Drawing.Bitmap -ArgumentList $cw, $ch, ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+                $gp = [System.Drawing.Graphics]::FromImage($pad)
+                $gp.CompositingMode = [System.Drawing.Drawing2D.CompositingMode]::SourceCopy
+                $gp.Clear([System.Drawing.Color]::Transparent)
+                $gp.DrawImage($bmp, $ox, $oy, $bmp.Width, $bmp.Height)
+                $gp.Dispose(); $bmp.Dispose()
+                $bmp = $pad
+            }
+        }
+        return $bmp
+    } catch { return $null }
+}
 function Test-PetAssets {
     if (-not (Test-Path (Join-Path $script:PetDir 'idle'))) { return $false }
     return $true
@@ -3295,6 +3353,8 @@ function Get-PetFrames {
             $script:PetCache.Remove($k)
         }
         $script:PetLastHb = [IntPtr]::Zero
+$script:PetLastAnim = ''
+$script:PetLastFrameIdx = 0
     }
     return $entry
 }
@@ -4219,11 +4279,6 @@ function Play-PetAction {
     param([string]$Id, [int]$HoldSec = 0)
     $dir = Join-Path $script:PetDir $Id
     if (-not (Test-Path $dir)) { return }
-    # 先把「当前这一帧」拷一份当淡入起点:建帧时会把旧缓存释放掉,句柄会失效
-    $fadeSrc = $null
-    if ($script:PetLastHb -ne [IntPtr]::Zero) {
-        try { $fadeSrc = [System.Drawing.Image]::FromHbitmap($script:PetLastHb) } catch { $fadeSrc = $null }
-    }
     $entry = Get-PetFrames -Anim $Id -Scale (Get-PetCfg).Scale
     if (-not $entry) { if ($fadeSrc) { try { $fadeSrc.Dispose() } catch { } }; return }
     $fps = $entry.Fps
@@ -4237,7 +4292,10 @@ function Play-PetAction {
     # 整段素材(没有 ms)就直着播一遍;只有老素材(短片段 + ms)才循环
     $pingpong = ($ms -gt 0)
     if ($meta -and $meta.PSObject.Properties['pingpong']) { $pingpong = [bool]$meta.pingpong }
-    # 交叉淡入到动作第一帧(用建帧前拷下来的那份,免得句柄已被释放)
+    # 交叉淡入:起点用「最后画的那一帧」重新解码出来的透明位图(不能用 HBITMAP 转,会丢 alpha)
+    $fadeSrc = $null
+    try { $fadeSrc = Get-PetFrameBitmap -Anim $script:PetLastAnim -Index $script:PetLastFrameIdx } catch { $fadeSrc = $null }
+    if (-not $fadeSrc) { Write-Log ('动作过渡:起点取不到 anim=[' + $script:PetLastAnim + '] idx=' + $script:PetLastFrameIdx) 'WARN' }
     if ($fadeSrc) {
         if ($script:PetFadeFromBmp) { try { $script:PetFadeFromBmp.Dispose() } catch { } }
         $script:PetFadeFromBmp = $fadeSrc
@@ -4413,11 +4471,13 @@ function Update-Pet {
         if ($script:PetLastHb -ne [IntPtr]::Zero) {
             try {
                 if ($script:PetFadeFromBmp) { $script:PetFadeFromBmp.Dispose() }
-                $script:PetFadeFromBmp = [System.Drawing.Image]::FromHbitmap($script:PetLastHb)
+                $script:PetFadeFromBmp = Get-PetFrameBitmap -Anim $script:PetLastAnim -Index $script:PetLastFrameIdx
                 $script:PetFadeTotal = 6
                 $script:PetFadeLeft = 6
                 Write-Log ('动作过渡:' + $anim + ' 交叉淡入 6 帧')
-            } catch { $script:PetFadeFromBmp = $null; $script:PetLastHb = [IntPtr]::Zero }
+            } catch { $script:PetFadeFromBmp = $null; $script:PetLastHb = [IntPtr]::Zero
+$script:PetLastAnim = ''
+$script:PetLastFrameIdx = 0 }
         }
         $script:PetAnim = $anim
         $script:PetLastIdx = -1
@@ -4431,6 +4491,8 @@ function Update-Pet {
             foreach ($hb in $script:PetCache[$k].Hbs) { [CampusNetPet.Layered]::FreeHBitmap($hb) }
         }
         $script:PetLastHb = [IntPtr]::Zero
+$script:PetLastAnim = ''
+$script:PetLastFrameIdx = 0
         $script:PetCache = @{}
         $script:PetLastIdx = -1
         # 位图刚释放,催一下 GC,免得托管包装攒着(重建两次能涨几十 MB)
@@ -4475,9 +4537,10 @@ function Update-Pet {
             # 过渡期:把「上一帧」和当前帧按比例混出来再贴
             try {
                 $fa = 1.0 - ($script:PetFadeLeft / [double]$script:PetFadeTotal)
-                $fb = [System.Drawing.Image]::FromHbitmap($hbNow)
-                $fm = Merge-PetBitmap -A $script:PetFadeFromBmp -B $fb -Alpha $fa
-                $fb.Dispose()
+                # 新帧也要用「重解出来的透明位图」,HBITMAP 转出来的会丢 alpha(混出来就是一团黑底)
+                $fb = Get-PetFrameBitmap -Anim $anim -Index $idx
+                $fm = 
+                if ($fb) { $fm = Merge-PetBitmap -A $script:PetFadeFromBmp -B $fb -Alpha $fa; $fb.Dispose() }
                 if ($fm) {
                     $hbNow = [CampusNetPet.Layered]::ToHBitmap($fm)
                     $fm.Dispose()
@@ -4491,6 +4554,8 @@ function Update-Pet {
             }
         }
         $script:PetLastHb = $entry.Hbs[$idx]
+        $script:PetLastAnim = $anim
+        $script:PetLastFrameIdx = $idx
         $null = [CampusNetPet.Layered]::Draw($script:PetForm.Handle, $hbNow, $entry.W, $entry.H, $px, $py, [byte]255)
         if ($ownHb) { try { [CampusNetPet.Layered]::FreeHBitmap($hbNow) } catch { } }
         $script:PetX = $px
