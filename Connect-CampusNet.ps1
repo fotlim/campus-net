@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     校园网自动登录 —— 菜单 / 托盘 / 开机自启 / 后台守护 / 多账号
