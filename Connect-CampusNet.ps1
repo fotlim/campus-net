@@ -32,7 +32,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('menu', 'setup', 'switch', 'delete', 'list', 'login', 'status', 'watch', 'tray', 'install', 'uninstall', 'synctime', 'wifi', 'doctor', 'check', 'background', 'log', 'repair', 'notify', 'nicreset', 'pet', 'weather', 'portal', 'collect', 'wizard')]
+    [ValidateSet('menu', 'setup', 'switch', 'delete', 'list', 'login', 'status', 'watch', 'tray', 'install', 'uninstall', 'synctime', 'wifi', 'doctor', 'check', 'background', 'log', 'repair', 'notify', 'nicreset', 'memclean', 'pet', 'weather', 'portal', 'collect', 'wizard')]
     [string]$Mode = 'menu',
 
     [string]$User,
@@ -50,6 +50,8 @@ param(
     [switch]$Elevated,
     [string]$WifiSsid = '',
     [switch]$NoWifi,
+    [ValidateSet('light', 'system', 'all')]
+    [string]$Scope = 'all',
     [switch]$Deep,
     [string]$BackgroundImage,
     [switch]$ClearBackground,
@@ -102,8 +104,9 @@ $LogFile    = Join-Path $WorkDir 'campus-net.log'
 $VbsFile    = Join-Path $WorkDir 'run-hidden.vbs'
 $TaskName   = 'CampusNet-AutoLogin'
 $RepairTaskName = 'CampusNet-Repair'
+$MemCleanTaskName = 'CampusNet-MemClean'
 $UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-$script:AppVersion = '1.2.2'
+$script:AppVersion = '1.2.3'
 $Curl = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
 $script:NicList = $null
 $script:NicListAt = [datetime]::MinValue
@@ -146,6 +149,11 @@ function Get-Settings {
         iconWander      = $false
         iconEatSec      = 180
         iconReady       = $false
+        memCleanAuto    = $true
+        memCleanMinFreePct = 12
+        memCleanCooldownMin = 10
+        memCleanSysInAuto = $false
+        lastMemClean    = ''
     }
     if (-not (Test-Path $SettingsFn)) { return $def }
     try {
@@ -185,6 +193,11 @@ function Get-Settings {
         if (-not $s.PSObject.Properties['iconWander']) { $s | Add-Member -NotePropertyName iconWander -NotePropertyValue $false -Force }
         if (-not $s.PSObject.Properties['iconEatSec']) { $s | Add-Member -NotePropertyName iconEatSec -NotePropertyValue 180 -Force }
         if (-not $s.PSObject.Properties['iconReady']) { $s | Add-Member -NotePropertyName iconReady -NotePropertyValue $false -Force }
+        if (-not $s.PSObject.Properties['memCleanAuto']) { $s | Add-Member -NotePropertyName memCleanAuto -NotePropertyValue $true -Force }
+        if (-not $s.PSObject.Properties['memCleanMinFreePct']) { $s | Add-Member -NotePropertyName memCleanMinFreePct -NotePropertyValue 12 -Force }
+        if (-not $s.PSObject.Properties['memCleanCooldownMin']) { $s | Add-Member -NotePropertyName memCleanCooldownMin -NotePropertyValue 10 -Force }
+        if (-not $s.PSObject.Properties['memCleanSysInAuto']) { $s | Add-Member -NotePropertyName memCleanSysInAuto -NotePropertyValue $false -Force }
+        if (-not $s.PSObject.Properties['lastMemClean']) { $s | Add-Member -NotePropertyName lastMemClean -NotePropertyValue '' -Force }
         return $s
     } catch { return $def }
 }
@@ -227,6 +240,11 @@ function Save-Settings {
         iconWander      = [bool]$(if ($null -ne $Settings.iconWander) { $Settings.iconWander } else { $false })
         iconEatSec      = [int]$(if ($Settings.iconEatSec) { $Settings.iconEatSec } else { 180 })
         iconReady       = [bool]$(if ($null -ne $Settings.iconReady) { $Settings.iconReady } else { $false })
+        memCleanAuto    = [bool]$(if ($null -ne $Settings.memCleanAuto) { $Settings.memCleanAuto } else { $true })
+        memCleanMinFreePct = [int]$(if ($Settings.memCleanMinFreePct) { $Settings.memCleanMinFreePct } else { 12 })
+        memCleanCooldownMin = [int]$(if ($Settings.memCleanCooldownMin) { $Settings.memCleanCooldownMin } else { 10 })
+        memCleanSysInAuto = [bool]$(if ($null -ne $Settings.memCleanSysInAuto) { $Settings.memCleanSysInAuto } else { $false })
+        lastMemClean    = [string]$Settings.lastMemClean
     } | ConvertTo-Json | Set-Content -Path $SettingsFn -Encoding UTF8
 }
 
@@ -262,6 +280,302 @@ function Write-Log {
 }
 
 function Write-Stdout { param([string]$Message) Write-Host $Message }
+
+# ================= 内存清理(Mem Reduct 精简版)=================
+# 只做三件事:① 自家进程 EmptyWorkingSet ② 清 standby list ③ 清系统文件缓存
+# ②③ 需要管理员;免 UAC 的方式是由最高权限计划任务代为执行(见 Register-MemCleanTask)
+
+$script:MemCs = @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace CampusNetMem {
+    public static class Mem {
+        [StructLayout(LayoutKind.Sequential)]
+        public struct MEMORYSTATUSEX {
+            public uint dwLength;
+            public uint dwMemoryLoad;
+            public ulong ullTotalPhys;
+            public ulong ullAvailPhys;
+            public ulong ullTotalPageFile;
+            public ulong ullAvailPageFile;
+            public ulong ullTotalVirtual;
+            public ulong ullAvailVirtual;
+            public ulong ullAvailExtendedVirtual;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX lpBuffer);
+
+        [DllImport("psapi.dll", SetLastError = true)]
+        static extern bool EmptyWorkingSet(IntPtr hProcess);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern IntPtr OpenProcess(int access, bool inherit, int pid);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool CloseHandle(IntPtr h);
+
+        [DllImport("ntdll.dll")]
+        static extern int NtSetSystemInformation(int infoClass, IntPtr info, int length);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        static extern bool OpenProcessToken(IntPtr h, uint access, out IntPtr token);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        static extern bool LookupPrivilegeValue(string system, string name, out long luid);
+
+        [StructLayout(LayoutKind.Sequential, Pack = 4)]
+        struct TOKEN_PRIVILEGES {
+            public uint Count;
+            public long Luid;
+            public uint Attr;
+        }
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        static extern bool AdjustTokenPrivileges(IntPtr token, bool disableAll, ref TOKEN_PRIVILEGES newState, int bufferLength, IntPtr prevState, IntPtr returnLength);
+
+        [DllImport("kernel32.dll")]
+        static extern IntPtr GetCurrentProcess();
+
+        // 返回:总物理内存 / 可用物理内存 / 内存负载百分比
+        public static ulong[] Snapshot() {
+            MEMORYSTATUSEX m = new MEMORYSTATUSEX();
+            m.dwLength = (uint)Marshal.SizeOf(typeof(MEMORYSTATUSEX));
+            GlobalMemoryStatusEx(ref m);
+            return new ulong[] { m.ullTotalPhys, m.ullAvailPhys, m.dwMemoryLoad };
+        }
+
+        // 把某个进程的工作集换出(用户态即可,不需要管理员)
+        public static bool TrimProcess(int pid) {
+            const int PROCESS_SET_QUOTA = 0x0100;
+            const int PROCESS_QUERY_INFORMATION = 0x0400;
+            IntPtr h = OpenProcess(PROCESS_SET_QUOTA | PROCESS_QUERY_INFORMATION, false, pid);
+            if (h == IntPtr.Zero) return false;
+            try { return EmptyWorkingSet(h); }
+            finally { CloseHandle(h); }
+        }
+
+        static bool EnablePrivilege(string name) {
+            const uint TOKEN_ADJUST_PRIVILEGES = 0x0020;
+            const uint TOKEN_QUERY = 0x0008;
+            const uint SE_PRIVILEGE_ENABLED = 0x0002;
+            IntPtr token;
+            if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, out token)) return false;
+            try {
+                long luid;
+                if (!LookupPrivilegeValue(null, name, out luid)) return false;
+                TOKEN_PRIVILEGES tp = new TOKEN_PRIVILEGES();
+                tp.Count = 1;
+                tp.Luid = luid;
+                tp.Attr = SE_PRIVILEGE_ENABLED;
+                return AdjustTokenPrivileges(token, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero);
+            } finally { CloseHandle(token); }
+        }
+
+        // SystemMemoryListInformation = 0x50,命令 4 = PurgeStandbyList
+        public static int PurgeStandby() {
+            EnablePrivilege("SeProfileSingleProcessPrivilege");
+            EnablePrivilege("SeIncreaseQuotaPrivilege");
+            IntPtr p = Marshal.AllocHGlobal(4);
+            try {
+                Marshal.WriteInt32(p, 4);
+                return NtSetSystemInformation(0x50, p, 4);
+            } finally { Marshal.FreeHGlobal(p); }
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct SYSTEM_FILECACHE_INFORMATION {
+            public IntPtr CurrentSize;
+            public IntPtr PeakSize;
+            public IntPtr PageFaultCount;
+            public IntPtr MinimumWorkingSet;
+            public IntPtr MaximumWorkingSet;
+            public IntPtr CurrentSizeIncludingTransitionInPages;
+            public IntPtr PeakSizeIncludingTransitionInPages;
+            public uint TransitionRePurposeCount;
+            public uint Flags;
+        }
+
+        // SystemFileCacheInformation = 0x15;Minimum/MaximumWorkingSet = -1 让系统回收文件缓存
+        public static int ClearFileCache() {
+            EnablePrivilege("SeIncreaseQuotaPrivilege");
+            SYSTEM_FILECACHE_INFORMATION info = new SYSTEM_FILECACHE_INFORMATION();
+            info.MinimumWorkingSet = (IntPtr)(-1);
+            info.MaximumWorkingSet = (IntPtr)(-1);
+            int size = Marshal.SizeOf(typeof(SYSTEM_FILECACHE_INFORMATION));
+            IntPtr p = Marshal.AllocHGlobal(size);
+            try {
+                Marshal.StructureToPtr(info, p, false);
+                return NtSetSystemInformation(0x15, p, size);
+            } finally { Marshal.FreeHGlobal(p); }
+        }
+    }
+}
+'@
+
+$script:MemApiReady = $false
+
+function Initialize-MemApi {
+    if ($script:MemApiReady) { return $true }
+    try {
+        if (-not ('CampusNetMem.Mem' -as [type])) {
+            Add-Type -TypeDefinition $script:MemCs -Language CSharp
+        }
+        $script:MemApiReady = $true
+        return $true
+    } catch {
+        Write-Log ('内存接口加载失败:' + $_.Exception.Message) 'WARN'
+        return $false
+    }
+}
+
+function Get-MemorySnapshot {
+    # 统一的内存快照:总 MB / 可用 MB / 可用百分比 / 负载百分比
+    $r = @{ TotalMB = 0; FreeMB = 0; FreePct = 0; LoadPct = 0 }
+    try {
+        if (-not (Initialize-MemApi)) { return $r }
+        $s = [CampusNetMem.Mem]::Snapshot()
+        $r.TotalMB = [int]($s[0] / 1MB)
+        $r.FreeMB = [int]($s[1] / 1MB)
+        $r.LoadPct = [int]$s[2]
+        if ($r.TotalMB -gt 0) { $r.FreePct = [int][Math]::Round(100.0 * $r.FreeMB / $r.TotalMB) }
+    } catch { }
+    return $r
+}
+
+function Get-CampusNetSelfPids {
+    # 自家进程:本脚本的 tray / watch / pet 三个模式(不含当前进程)
+    $list = @()
+    try {
+        $procs = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue
+        foreach ($p in $procs) {
+            if ($p.ProcessId -eq $PID) { continue }
+            $cmd = [string]$p.CommandLine
+            if ($cmd -notmatch 'Connect-CampusNet\.ps1') { continue }
+            if ($cmd -match '\-Mode\s+(tray|watch|pet)\b') { $list += [int]$p.ProcessId }
+        }
+    } catch { }
+    return $list
+}
+
+function Get-SelfWorkingSetMB {
+    param([int[]]$Pids)
+    $sum = 0
+    foreach ($p in $Pids) {
+        try { $sum += [int]((Get-Process -Id $p -ErrorAction SilentlyContinue).WorkingSet64 / 1MB) } catch { }
+    }
+    return $sum
+}
+
+function Invoke-MemoryCleanLight {
+    # 轻清:自家进程工作集换出 + GC。零权限,随时可做
+    $before = Get-MemorySnapshot
+    $pids = @(Get-CampusNetSelfPids)
+    $wsBefore = Get-SelfWorkingSetMB -Pids $pids
+    $done = 0
+    foreach ($p in $pids) {
+        try { if ([CampusNetMem.Mem]::TrimProcess($p)) { $done++ } } catch { }
+    }
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
+    $wsAfter = Get-SelfWorkingSetMB -Pids $pids
+    $after = Get-MemorySnapshot
+    $msg = '内存轻清:' + $done + '/' + $pids.Count + ' 个自家进程,工作集 ' + $wsBefore + '→' + $wsAfter + ' MB,可用 ' + $before.FreeMB + '→' + $after.FreeMB + ' MB'
+    Write-Log $msg 'OK'
+    return @{ Ok = ($done -gt 0); Message = $msg; FreeBefore = $before.FreeMB; FreeAfter = $after.FreeMB; WsBefore = $wsBefore; WsAfter = $wsAfter }
+}
+
+function Invoke-MemoryCleanSystem {
+    # 系统清:清 standby list + 文件缓存(需管理员;非管理员会拿到 NTSTATUS 失败码)
+    $before = Get-MemorySnapshot
+    if (-not (Initialize-MemApi)) { return @{ Ok = $false; Message = '内存接口不可用' } }
+    $st1 = 0
+    $st2 = 0
+    try { $st1 = [CampusNetMem.Mem]::PurgeStandby() } catch { $st1 = -99 }
+    try { $st2 = [CampusNetMem.Mem]::ClearFileCache() } catch { $st2 = -99 }
+    Start-Sleep -Milliseconds 300
+    $after = Get-MemorySnapshot
+    $ok = ($st1 -eq 0)
+    $msg = '内存系统清理:standby ' + $(if ($st1 -eq 0) { 'OK' } else { '失败(0x{0:X8})' -f $st1 }) + ',文件缓存 ' + $(if ($st2 -eq 0) { 'OK' } else { '失败(0x{0:X8})' -f $st2 }) + ',可用 ' + $before.FreeMB + '→' + $after.FreeMB + ' MB'
+    if (-not $ok) { $msg += ' —— 需要管理员权限' }
+    Write-Log $msg $(if ($ok) { 'OK' } else { 'WARN' })
+    return @{ Ok = $ok; Message = $msg; FreeBefore = $before.FreeMB; FreeAfter = $after.FreeMB }
+}
+
+function Invoke-MemoryClean {
+    param([ValidateSet('light', 'system', 'all')][string]$Scope = 'light')
+    $parts = @()
+    if ($Scope -in @('light', 'all')) { $parts += (Invoke-MemoryCleanLight) }
+    if ($Scope -in @('system', 'all')) { $parts += (Invoke-MemoryCleanSystem) }
+    $free = (Get-MemorySnapshot).FreeMB
+    try {
+        $s = Get-Settings
+        $s.lastMemClean = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+        Save-Settings -Settings $s
+    } catch { }
+    return @{ Parts = $parts; FreeMB = $free }
+}
+
+function Get-MemCleanTask {
+    try { return (Get-ScheduledTask -TaskName $MemCleanTaskName -ErrorAction SilentlyContinue) } catch { return $null }
+}
+
+function Register-MemCleanTask {
+    # 提权清理任务:平时不跑,只有托盘点「系统清理」时才被唤起(不弹 UAC)
+    if (-not (Test-Elevated)) {
+        Write-Log '当前不是管理员:不注册内存清理提权任务,托盘里的「系统清理」将不可用。要用请用管理员运行安装(加 -Elevated)' 'WARN'
+        return $false
+    }
+    try {
+        $arg = '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -Mode memclean -Scope all -Background' -f $SelfScript
+        $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arg
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+            -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 3)
+        $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Highest
+        if (Get-ScheduledTask -TaskName $MemCleanTaskName -ErrorAction SilentlyContinue) {
+            Unregister-ScheduledTask -TaskName $MemCleanTaskName -Confirm:$false
+        }
+        Register-ScheduledTask -TaskName $MemCleanTaskName -Action $action -Settings $settings `
+            -Principal $principal -Description '校园网自动登录:提权清理内存(供托盘调用,不弹 UAC)' | Out-Null
+        Write-Log ('已注册提权内存清理任务 ' + $MemCleanTaskName) 'OK'
+        return $true
+    } catch {
+        Write-Log ('注册提权内存清理任务失败:' + $_.Exception.Message) 'WARN'
+        return $false
+    }
+}
+
+function Start-MemCleanTask {
+    # 用提权任务做系统清理(不弹 UAC);任务不存在时返回 false
+    $task = Get-MemCleanTask
+    if (-not $task) { return $false }
+    try {
+        Start-ScheduledTask -TaskName $MemCleanTaskName
+        return $true
+    } catch {
+        Write-Log ('唤起内存清理任务失败:' + $_.Exception.Message) 'WARN'
+        return $false
+    }
+}
+
+function Test-MemCleanDue {
+    # 自动清理判断:开关 + 阈值(可用百分比) + 冷却
+    try {
+        $s = Get-Settings
+        if (-not $s.memCleanAuto) { return $false }
+        $last = [string]$s.lastMemClean
+        if ($last) {
+            try {
+                $mins = ((Get-Date) - [datetime]::Parse($last)).TotalMinutes
+                if ($mins -lt [int]$s.memCleanCooldownMin) { return $false }
+            } catch { }
+        }
+        $m = Get-MemorySnapshot
+        if ($m.TotalMB -le 0) { return $false }
+        return ($m.FreePct -lt [int]$s.memCleanMinFreePct)
+    } catch { return $false }
+}
 
 # ---------------- RC4(照抄门户 JS,已交叉验证) ----------------
 function Get-Rc4Hex {
@@ -6248,6 +6562,173 @@ function Invoke-Tray {
                     -Actions @('打开菜单|campusnet:menu', '立即登录|campusnet:login'))
         })
     [void]$menu.Items.Add($itemNotifyTest)
+    # ---- 内存(Mem Reduct 精简版:轻清 / 系统清理 / 自动阈值清理)----
+    $itemMem = New-Object System.Windows.Forms.ToolStripMenuItem
+    $itemMem.Text = '内存'
+
+    $itemMemState = New-Object System.Windows.Forms.ToolStripMenuItem
+    $itemMemState.Text = '可用 - / - MB'
+    $itemMemState.add_Click({
+            try {
+                $m = Get-MemorySnapshot
+                $itemMemState.Text = ('可用 {0} MB / {1} MB ({2}%)' -f $m.FreeMB, $m.TotalMB, $m.FreePct)
+            } catch { }
+        })
+    [void]$itemMem.DropDownItems.Add($itemMemState)
+
+    $itemMemLight = New-Object System.Windows.Forms.ToolStripMenuItem
+    $itemMemLight.Text = '轻清(自家进程,免管理员)'
+    $itemMemLight.add_Click({
+            try {
+                $r = Invoke-MemoryClean -Scope light
+                $m = Get-MemorySnapshot
+                $itemMemState.Text = ('可用 {0} MB / {1} MB ({2}%)' -f $m.FreeMB, $m.TotalMB, $m.FreePct)
+                [void][System.Windows.Forms.MessageBox]::Show(($r.Parts | ForEach-Object { $_.Message }) -join "`r`n", '轻清完成')
+            } catch { }
+        })
+    [void]$itemMem.DropDownItems.Add($itemMemLight)
+
+    $itemMemSys = New-Object System.Windows.Forms.ToolStripMenuItem
+    $itemMemSys.Text = '系统清理(standby + 文件缓存)'
+    $itemMemSys.add_Click({
+            try {
+                $r = Invoke-MemoryClean -Scope system
+                $ok = $true
+                foreach ($p in $r.Parts) { if (-not $p.Ok) { $ok = $false } }
+                if ($ok) {
+                    [void][System.Windows.Forms.MessageBox]::Show(($r.Parts | ForEach-Object { $_.Message }) -join "`r`n", '系统清理')
+                } elseif (Start-MemCleanTask) {
+                    [void](Send-Notify -Title '内存清理' -Message '直接清理被拒,已改由提权任务执行,2 秒后可在日志里看结果' -Kind 'info' -Tag 'memclean' -MinIntervalSec 10)
+                } else {
+                    [void][System.Windows.Forms.MessageBox]::Show('系统清理被系统拒绝,且没有提权任务可用。' + "`r`n" + '请以管理员身份运行安装(加 -Elevated)注册提权清理任务,或直接以管理员运行本脚本。', '系统清理不可用')
+                }
+                $m = Get-MemorySnapshot
+                $itemMemState.Text = ('可用 {0} MB / {1} MB ({2}%)' -f $m.FreeMB, $m.TotalMB, $m.FreePct)
+            } catch { }
+        })
+    [void]$itemMem.DropDownItems.Add($itemMemSys)
+
+    $itemMemAll = New-Object System.Windows.Forms.ToolStripMenuItem
+    $itemMemAll.Text = '全部清理(轻清 + 系统)'
+    $itemMemAll.add_Click({
+            try {
+                $r = Invoke-MemoryClean -Scope all
+                $ok = $true
+                foreach ($p in $r.Parts) { if (-not $p.Ok) { $ok = $false } }
+                if ($ok) {
+                    [void][System.Windows.Forms.MessageBox]::Show(($r.Parts | ForEach-Object { $_.Message }) -join "`r`n", '全部清理')
+                } elseif (Start-MemCleanTask) {
+                    [void](Send-Notify -Title '内存清理' -Message '直清部分被拒,已改由提权任务执行(含系统缓存)' -Kind 'info' -Tag 'memclean' -MinIntervalSec 10)
+                } else {
+                    [void][System.Windows.Forms.MessageBox]::Show('清理被系统拒绝,且没有提权任务可用。可以先点「轻清」,或管理员运行安装注册提权清理任务。', '全部清理')
+                }
+                $m = Get-MemorySnapshot
+                $itemMemState.Text = ('可用 {0} MB / {1} MB ({2}%)' -f $m.FreeMB, $m.TotalMB, $m.FreePct)
+            } catch { }
+        })
+    [void]$itemMem.DropDownItems.Add($itemMemAll)
+
+    [void]$itemMem.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+
+    $itemMemAuto = New-Object System.Windows.Forms.ToolStripMenuItem
+    $itemMemAuto.Text = '内存紧张时自动清理'
+    $itemMemAuto.Checked = [bool](Get-Settings).memCleanAuto
+    $itemMemAuto.add_Click({
+            try {
+                $s = Get-Settings
+                $s.memCleanAuto = -not [bool]$s.memCleanAuto
+                Save-Settings -Settings $s
+                $itemMemAuto.Checked = [bool]$s.memCleanAuto
+                Write-Log ('内存自动清理:' + $(if ($s.memCleanAuto) { '开' } else { '关' }))
+            } catch { }
+        })
+    [void]$itemMem.DropDownItems.Add($itemMemAuto)
+
+    # 阈值可手动调:可用内存低于该百分比时触发
+    $itemMemPct = New-Object System.Windows.Forms.ToolStripMenuItem
+    $itemMemPct.Text = ('触发阈值: 可用 {0}% 以下' -f [int](Get-Settings).memCleanMinFreePct)
+    foreach ($pv in @(5, 8, 10, 12, 15, 20, 25)) {
+        $miPv = New-Object System.Windows.Forms.ToolStripMenuItem
+        $miPv.Text = ('可用 {0}% 以下' -f $pv)
+        $miPv.Tag = $pv
+        $miPv.Checked = ([int](Get-Settings).memCleanMinFreePct -eq $pv)
+        $miPv.add_Click({
+                try {
+                    $s = Get-Settings
+                    $s.memCleanMinFreePct = [int]$this.Tag
+                    Save-Settings -Settings $s
+                    $itemMemPct.Text = ('触发阈值: 可用 {0}% 以下' -f $s.memCleanMinFreePct)
+                    foreach ($x in $itemMemPct.DropDownItems) { if ($x.Tag) { $x.Checked = ([int]$x.Tag -eq [int]$s.memCleanMinFreePct) } }
+                    Write-Log ('内存自动清理阈值:可用低于 ' + $s.memCleanMinFreePct + '% 时触发')
+                } catch { }
+            })
+        [void]$itemMemPct.DropDownItems.Add($miPv)
+    }
+    [void]$itemMem.DropDownItems.Add($itemMemPct)
+
+    # 冷却时间可手动调:两次自动清理之间至少隔多久
+    $itemMemCool = New-Object System.Windows.Forms.ToolStripMenuItem
+    $itemMemCool.Text = ('冷却时间: {0} 分钟' -f [int](Get-Settings).memCleanCooldownMin)
+    foreach ($cv in @(3, 5, 10, 15, 30, 60)) {
+        $miCv = New-Object System.Windows.Forms.ToolStripMenuItem
+        $miCv.Text = ('{0} 分钟' -f $cv)
+        $miCv.Tag = $cv
+        $miCv.Checked = ([int](Get-Settings).memCleanCooldownMin -eq $cv)
+        $miCv.add_Click({
+                try {
+                    $s = Get-Settings
+                    $s.memCleanCooldownMin = [int]$this.Tag
+                    Save-Settings -Settings $s
+                    $itemMemCool.Text = ('冷却时间: {0} 分钟' -f $s.memCleanCooldownMin)
+                    foreach ($x in $itemMemCool.DropDownItems) { if ($x.Tag) { $x.Checked = ([int]$x.Tag -eq [int]$s.memCleanCooldownMin) } }
+                    Write-Log ('内存自动清理冷却:' + $s.memCleanCooldownMin + ' 分钟')
+                } catch { }
+            })
+        [void]$itemMemCool.DropDownItems.Add($miCv)
+    }
+    [void]$itemMem.DropDownItems.Add($itemMemCool)
+
+    $itemMemSysAuto = New-Object System.Windows.Forms.ToolStripMenuItem
+    $itemMemSysAuto.Text = '自动清理时也清系统缓存(需提权任务)'
+    $itemMemSysAuto.Checked = [bool](Get-Settings).memCleanSysInAuto
+    $itemMemSysAuto.add_Click({
+            try {
+                $s = Get-Settings
+                $s.memCleanSysInAuto = -not [bool]$s.memCleanSysInAuto
+                Save-Settings -Settings $s
+                $itemMemSysAuto.Checked = [bool]$s.memCleanSysInAuto
+            } catch { }
+        })
+    [void]$itemMem.DropDownItems.Add($itemMemSysAuto)
+
+    [void]$itemMem.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+
+    $itemMemTask = New-Object System.Windows.Forms.ToolStripMenuItem
+    $itemMemTask.Text = '注册/修复提权清理任务(需管理员)'
+    $itemMemTask.add_Click({
+            try {
+                if (-not (Test-Elevated)) {
+                    [void][System.Windows.Forms.MessageBox]::Show('这一步需要管理员权限:请用管理员运行安装(加 -Elevated)。', '注册清理任务')
+                    return
+                }
+                if (Register-MemCleanTask) {
+                    [void][System.Windows.Forms.MessageBox]::Show('已注册提权清理任务 CampusNet-MemClean。', '完成')
+                } else {
+                    [void][System.Windows.Forms.MessageBox]::Show('注册失败,详情见日志。', '失败')
+                }
+            } catch { }
+        })
+    [void]$itemMem.DropDownItems.Add($itemMemTask)
+
+    [void]$menu.Items.Add($itemMem)
+
+    # 每次打开菜单都刷新一下可用内存
+    $menu.add_Opening({
+            try {
+                $m = Get-MemorySnapshot
+                $itemMemState.Text = ('可用 {0} MB / {1} MB ({2}%)' -f $m.FreeMB, $m.TotalMB, $m.FreePct)
+            } catch { }
+        })
 
     $itemPetModel = New-Object System.Windows.Forms.ToolStripMenuItem
     $itemPetModel.Text = '桌宠模型'
@@ -6325,12 +6806,26 @@ function Invoke-Tray {
 
     $timer = New-Object System.Windows.Forms.Timer
     $timer.Interval = 2000
+    $script:MemAutoCheckAt = [datetime]::MinValue
     $timer.add_Tick({
             try {
                 Update-TrayState
                 Start-WatcherIfNeeded
                 Sync-PetWithSettings
                 Restore-EatenIcons
+                # 内存自动清理:每 60 秒评估一次(阈值/冷却都可在菜单里调)
+                $nowT = Get-Date
+                if ($script:MemAutoCheckAt -eq [datetime]::MinValue -or ($nowT - $script:MemAutoCheckAt).TotalSeconds -ge 60) {
+                    $script:MemAutoCheckAt = $nowT
+                    if (Test-MemCleanDue) {
+                        $mBefore = Get-MemorySnapshot
+                        [void](Invoke-MemoryClean -Scope light)
+                        $s = Get-Settings
+                        if ($s.memCleanSysInAuto) { [void](Start-MemCleanTask) }
+                        $mAfter = Get-MemorySnapshot
+                        [void](Send-Notify -Title '内存清理' -Message ('可用内存偏低(' + $mBefore.FreePct + '%),已自动清理;可用 ' + $mBefore.FreeMB + '→' + $mAfter.FreeMB + ' MB') -Kind 'info' -Tag 'memauto' -MinIntervalSec 600)
+                    }
+                }
             } catch { }
         })
     $timer.Start()
@@ -6419,6 +6914,9 @@ function Invoke-Install {
 
     # 提权重置网卡用的助手任务:平时不跑,只有自动修复要动网卡时才被唤起(不会弹 UAC)
     [void](Register-RepairTask)
+
+    # 提权内存清理任务(托盘「系统清理」用,不弹 UAC)
+    [void](Register-MemCleanTask)
 
     Write-Stdout ''
     if ($runMode -eq 'tray') {
@@ -7759,6 +8257,13 @@ switch ($Mode) {
         if ($r.Ok) { exit 0 }
         Write-Log ('提权重置网卡失败:' + $r.Detail) 'ERROR'
         exit 1
+    }
+    'memclean' {
+        # 提权助手任务专用:被托盘「系统清理」唤起,清 standby + 文件缓存
+        $r = Invoke-MemoryClean -Scope $Scope
+        $okAll = $true
+        foreach ($p in $r.Parts) { if (-not $p.Ok) { $okAll = $false } }
+        if ($okAll) { exit 0 } else { exit 1 }
     }
 
     'notify' {        # 手动验一下通知到底通不通(排查"我这边没弹通知"用)
