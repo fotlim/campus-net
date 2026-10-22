@@ -731,19 +731,106 @@ function Get-NetSpeed {
 }
 
 # ---------------- WiFi ----------------
+# 两个坑要一起处理:
+#  1) Windows 11 26H2 起,netsh 的 WLAN 查询命令要求“位置权限”,没开就只回一句
+#     “网络 shell 命令需要位置权限才能访问 WLAN 信息” + 错误 5。
+#  2) 26H2 的 netsh 输出是 UTF-8,而脚本常跑在没有控制台/输出被重定向的宿主里,
+#     那时 [Console]::OutputEncoding 是 GBK,直接 & 调用会把中文解成乱码写进日志。
+# 所以统一用 Invoke-NativeLines 读原始字节再智能解码,并保留退出码。
+$script:WlanLocationBlocked = $false
+$script:WlanRepairAt         = [datetime]::MinValue
+$script:NativeLastExitCode  = 0
+
+function Invoke-NativeLines {
+    param([string]$FilePath, [string]$Arguments = '')
+
+    $script:NativeLastExitCode = 0
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName               = $FilePath
+    $psi.Arguments              = $Arguments
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError  = $true
+    $psi.UseShellExecute        = $false
+    $psi.CreateNoWindow         = $true
+
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+    [void]$proc.Start()
+
+    $ms  = New-Object System.IO.MemoryStream
+    $buf = New-Object byte[] 8192
+    $s   = $proc.StandardOutput.BaseStream
+    while ($true) {
+        $n = $s.Read($buf, 0, $buf.Length)
+        if ($n -le 0) { break }
+        $ms.Write($buf, 0, $n)
+    }
+    $errText = ''
+    try { $errText = $proc.StandardError.ReadToEnd() } catch { }
+    [void]$proc.WaitForExit(20000)
+    try { $script:NativeLastExitCode = $proc.ExitCode } catch { }
+    $proc.Dispose()
+
+    $bytes = $ms.ToArray()
+    $ms.Dispose()
+    $body = ''
+    if ($bytes.Length -gt 0) {
+        try {
+            $strict = New-Object System.Text.UTF8Encoding($false, $true)
+            $body = $strict.GetString($bytes)
+        } catch {
+            $body = [System.Text.Encoding]::GetEncoding(936).GetString($bytes)
+        }
+    }
+    if ($errText) { $body = $body + "`r`n" + $errText }
+    return @($body -split "`r?`n")
+}
+
+function Get-NetshPath {
+    return (Join-Path $env:SystemRoot 'System32\netsh.exe')
+}
+
+function Test-WlanLocationBlocked {
+    param([string[]]$Lines)
+    return [bool](($Lines -join "`n") -match '位置权限|privacy-location|error 5|错误 5|access is denied')
+}
+
 function Get-WifiInfo {
     $ssid = ''
     $state = ''
     $ifName = ''
-    try { $out = & netsh wlan show interfaces 2>$null }
-    catch { return [pscustomobject]@{ State = ''; Ssid = ''; Interface = '' } }
+    $out = @()
+    try { $out = Invoke-NativeLines (Get-NetshPath) 'wlan show interfaces' } catch { $out = @() }
+
+    $blocked = Test-WlanLocationBlocked $out
+    if ($blocked) { $script:WlanLocationBlocked = $true }
+    elseif (($out -join "`n") -match '(?m)^\s*SSID\b|(?m)^\s*(State|状态)\s*:') { $script:WlanLocationBlocked = $false }
 
     foreach ($line in $out) {
-        if ($line -match '^\s*Name\s*:\s*(.+)$' -and -not $ifName) { $ifName = $Matches[1].Trim() }
+        if ($line -match '^\s*(Name|名称)\s*:\s*(.+)$' -and -not $ifName) { $ifName = $Matches[2].Trim() }
         elseif ($line -match '^\s*SSID\s*:\s*(.+)$') { $ssid = $Matches[1].Trim() }
         elseif ($line -match '^\s*(State|状态)\s*:\s*(.+)$') { $state = $Matches[2].Trim() }
     }
-    return [pscustomobject]@{ State = $state; Ssid = $ssid; Interface = $ifName }
+
+    # netsh 被位置权限挡住时,退回 NLA(Get-NetAdapter / Get-NetConnectionProfile),
+    # 这条路不经过位置权限,能可靠判断“连没连、连的是哪个 SSID”。
+    if (-not $state -or -not $ssid) {
+        try {
+            $ad = @(Get-NetAdapter -ErrorAction Stop | Where-Object { $_.PhysicalMediaType -match '802\.11' })
+            if ($ad.Count -gt 0) {
+                if (-not $ifName) { $ifName = $ad[0].Name }
+                if ($ad[0].Status -eq 'Up') {
+                    $p = @(Get-NetConnectionProfile -InterfaceIndex $ad[0].ifIndex -ErrorAction SilentlyContinue)
+                    if ($p.Count -gt 0) {
+                        if (-not $ssid) { $ssid = $p[0].Name }
+                        $state = 'connected'
+                    } else { $state = 'disconnected' }
+                } else { $state = 'disconnected' }
+            }
+        } catch { }
+    }
+
+    return [pscustomobject]@{ State = $state; Ssid = $ssid; Interface = $ifName; LocationBlocked = $script:WlanLocationBlocked }
 }
 
 function Test-WifiConnected {
@@ -764,7 +851,7 @@ $script:WifiListTime = [datetime]::MinValue
 function Get-WifiProfiles {
     $list = New-Object System.Collections.ArrayList
     try {
-        foreach ($line in (& netsh wlan show profiles 2>$null)) {
+        foreach ($line in (Invoke-NativeLines (Get-NetshPath) 'wlan show profiles')) {
             if ($line -match ':\s*(\S.*?)\s*$') {
                 $n = $Matches[1]
                 if ($n -and -not $list.Contains($n)) { [void]$list.Add($n) }
@@ -779,7 +866,7 @@ function Get-WifiVisible {
     $list = New-Object System.Collections.ArrayList
     $cur = $null
     try {
-        foreach ($line in (& netsh wlan show networks mode=bssid 2>$null)) {
+        foreach ($line in (Invoke-NativeLines (Get-NetshPath) 'wlan show networks mode=bssid')) {
             if ($line -match '^SSID\s+\d+\s*:\s*(.*)$') {
                 if ($cur) { [void]$list.Add($cur) }
                 $cur = [pscustomobject]@{ Ssid = $Matches[1].Trim(); Open = $false; Signal = 0 }
@@ -825,6 +912,7 @@ function Update-WifiList {
         TargetOpen       = [bool]($tv -and $tv.Open)
         TargetSignal     = $(if ($tv) { [int]$tv.Signal } else { 0 })
         TargetInProfiles = [bool]($profiles -contains $WifiSsid)
+        LocationBlocked  = [bool]$info.LocationBlocked
     }
 
     $script:WifiList = $res
@@ -874,13 +962,13 @@ function Add-OpenWifiProfile {
     $tmp = Join-Path $env:TEMP ('wifi-profile-' + [guid]::NewGuid().ToString('N') + '.xml')
     try {
         [System.IO.File]::WriteAllText($tmp, $xml, (New-Object System.Text.UTF8Encoding($false)))
-        $r = & netsh wlan add profile (('filename="{0}"' -f $tmp)) user=current 2>&1
+        $r = Invoke-NativeLines (Get-NetshPath) ('wlan add profile filename="{0}" user=current' -f $tmp)
         $msg = (($r | Where-Object { $_ }) -join ' ').Trim()
-        if ($LASTEXITCODE -eq 0) {
+        if ($script:NativeLastExitCode -eq 0) {
             Write-Log ('已自动创建开放网络配置: ' + $Ssid) 'OK'
             return $true
         }
-        Write-Log ('自动创建 WiFi 配置失败(' + $LASTEXITCODE + '): ' + $msg) 'WARN'
+        Write-Log ('自动创建 WiFi 配置失败(' + $script:NativeLastExitCode + '): ' + $msg) 'WARN'
         return $false
     } catch {
         Write-Log ('自动创建 WiFi 配置出错: ' + $_.Exception.Message) 'WARN'
@@ -888,6 +976,59 @@ function Add-OpenWifiProfile {
     } finally {
         if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
     }
+}
+
+function Repair-WlanLocationPermission {
+    # Windows 11 26H2 起,「读取 WLAN 信息」被纳入位置权限:netsh wlan show/connect
+    # 统统只回一句“网络 shell 命令需要位置权限”+ 错误 5。升级 26H2 后系统常把
+    # 定位服务关掉,于是脚本误判“没连 WiFi”,每 30 秒重连一次刷屏。
+    # 有管理员权限就自己把开关打开(注册表 + 重启定位服务);否则只写日志提示手开。
+    $now = Get-Date
+    if ($script:WlanRepairAt -ne [datetime]::MinValue -and ($now - $script:WlanRepairAt).TotalMinutes -lt 10) { return $false }
+    if (-not (Test-Elevated)) {
+        Write-Log '需要位置权限:设置 → 隐私和安全性 → 位置,打开「定位服务」(或右键以管理员身份运行脚本让它自动修复)' 'ERROR'
+        return $false
+    }
+    $script:WlanRepairAt = $now
+    Write-Log '尝试自动修复「位置权限」(Windows 11 26H2 的 WLAN 限制)…' 'WARN'
+
+    try {
+        $cs = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location'
+        if (-not (Test-Path $cs)) { New-Item -Path $cs -Force | Out-Null }
+        New-ItemProperty -Path $cs -Name 'Value' -Value 'Allow' -PropertyType String -Force | Out-Null
+        $np = Join-Path $cs 'NonPackaged'
+        if (-not (Test-Path $np)) { New-Item -Path $np -Force | Out-Null }
+        New-ItemProperty -Path $np -Name 'Value' -Value 'Allow' -PropertyType String -Force | Out-Null
+        $npExe = Join-Path $np 'C:#Windows#System32#netsh.exe'
+        if (-not (Test-Path $npExe)) { New-Item -Path $npExe -Force | Out-Null }
+        New-ItemProperty -Path $npExe -Name 'Value' -Value 'Allow' -PropertyType String -Force | Out-Null
+        $cfg = 'HKLM:\SYSTEM\CurrentControlSet\Services\lfsvc\Service\Configuration'
+        if (Test-Path $cfg) { New-ItemProperty -Path $cfg -Name 'Status' -Value 1 -PropertyType DWord -Force | Out-Null }
+    } catch {
+        Write-Log ('写位置权限注册表失败: ' + $_.Exception.Message) 'WARN'
+    }
+
+    try {
+        Restart-Service -Name 'lfsvc' -Force -ErrorAction Stop
+        Start-Sleep -Seconds 2
+        Restart-Service -Name 'WlanSvc' -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 3
+        Write-Log '定位服务已重启,重新读取 WLAN 信息' 'OK'
+    } catch {
+        Write-Log ('重启定位服务失败: ' + $_.Exception.Message) 'WARN'
+        return $false
+    }
+
+    # 改完不一定立刻生效(设置页和服务都有缓存),这里验一次,没好就给出明确的手动路径
+    $after = @()
+    try { $after = Invoke-NativeLines (Get-NetshPath) 'wlan show interfaces' } catch { $after = @() }
+    if (Test-WlanLocationBlocked $after) {
+        Write-Log '自动打开位置权限没立即生效:打开 设置 → 隐私和安全性 → 位置,把「定位服务」打开(可能要等几秒再刷新)' 'WARN'
+        return $false
+    }
+    $script:WlanLocationBlocked = $false
+    Write-Log 'netsh 已能正常读取 WLAN 信息' 'OK'
+    return $true
 }
 
 function Connect-CampusWifi {
@@ -899,6 +1040,14 @@ function Connect-CampusWifi {
     }
 
     $info = Get-WifiInfo
+    if ($info.LocationBlocked) {
+        Write-Log 'WLAN 查询被「位置权限」挡住(Windows 11 26H2 起,netsh 读 WLAN 信息需要定位服务)' 'WARN'
+        try {
+            if (Repair-WlanLocationPermission) { $info = Get-WifiInfo }
+        } catch {
+            Write-Log ('位置权限自动修复出错: ' + $_.Exception.Message) 'WARN'
+        }
+    }
     Write-Log ('当前 WiFi: ' + $(if ($info.Ssid) { $info.Ssid } else { '(未连接)' }) + ' ,准备连接 ' + $Ssid)
 
     # 无线服务没跑就先拉起来(通常需要管理员,失败也不致命)
@@ -919,7 +1068,7 @@ function Connect-CampusWifi {
         Write-Log ('Windows 里没有 ' + $Ssid + ' 的配置,检测到是开放网络,自动补一份') 'WARN'
         if (Add-OpenWifiProfile -Ssid $Ssid) { $wl = Update-WifiList -Force }
     }
-    if (-not $wl.TargetInProfiles) {
+    if (-not $wl.TargetInProfiles -and -not $wl.LocationBlocked) {
         $visList = @($wl.Visible)
         $visTxt = $(if ($visList.Count) { ($visList | ForEach-Object { $_.Ssid }) -join ' / ' } else { '(一个都没搜到)' })
         Write-Log ('Windows 里没有保存 ' + $Ssid + ' 的配置。请先手动连接一次这个 WiFi,之后就能自动连') 'ERROR'
@@ -941,8 +1090,9 @@ function Connect-CampusWifi {
             Write-Log ('刷新列表后 ' + $Ssid + ' 可见(信号 ' + $wl2.TargetSignal + '%),再试一次') 'WARN'
         }
 
-        $r = & netsh wlan connect (('name="{0}"' -f $Ssid)) 2>&1
+        $r = Invoke-NativeLines (Get-NetshPath) ('wlan connect name="{0}"' -f $Ssid)
         $msg = (($r | Where-Object { $_ }) -join ' ').Trim()
+        if (-not $msg) { $msg = '(无输出)' }
         Write-Log ('netsh wlan connect -> ' + $msg)
 
         $deadline = (Get-Date).AddSeconds($TimeoutSec)
